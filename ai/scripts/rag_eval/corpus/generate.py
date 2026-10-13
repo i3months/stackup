@@ -343,7 +343,7 @@ class Generator:
                 msgs[-1]["content"] += "\n\n이전 시도의 문제 (반드시 고칠 것): " + "; ".join(problems)
             plan = self.llm.chat_json(msgs, schema=PLAN_SCHEMA,
                                       seed=seed + 100 * attempt, temperature=TEMP_CREATIVE, tag=f"{slot['persona_id']}-plan")
-            problems = validate_plan(plan, need_repo=repo is not None, band=slot['years_band'])
+            problems = validate_plan(plan, need_repo=repo is not None, band=slot['years_band'], timeline=timeline)
             if plan["name"] in used:
                 problems.append(f"이름 {plan['name']} 중복")
             if not problems:
@@ -572,8 +572,10 @@ def career_years(plan: dict[str, Any]) -> float | None:
     return months / 12
 
 
-def validate_plan(plan: dict[str, Any], *, need_repo: bool, band: str) -> list[str]:
-    """연차 구간은 경력 합계로 판단하고, 합계와 years_of_experience(headline) 차이는 1년 이내 (관리자 T03 답변 3)."""
+def validate_plan(plan: dict[str, Any], *, need_repo: bool, band: str,
+                  timeline: dict[str, Any] | None = None) -> list[str]:
+    """연차 구간은 경력 합계로 판단하고, 합계와 years_of_experience(headline) 차이는 1년 이내 (관리자 T03 답변 3).
+    연차 검사가 실패하면 지정 재직 기간 밖의 kind=work 경험을 짚어 재시도 피드백에 넣는다 (T03 P10: 지정 밖 work 경험을 더해 4회 실패)."""
     problems = []
     lo, hi = BAND_RANGE[band]
     cy = career_years(plan)
@@ -591,6 +593,13 @@ def validate_plan(plan: dict[str, Any], *, need_repo: bool, band: str) -> list[s
             problems.append(f"경력 합계 {cy:.1f}년과 연차 {n}년 차이 > 1년")
         if not m or int(m.group(1)) != n:
             problems.append(f"headline '{plan['headline']}' 의 연차가 {n} 과 다름")
+    if problems and timeline and timeline["companies"]:  # 판정 기준은 그대로, 연차 실패 때 고칠 곳만 짚어 준다
+        allowed = {period_months(f"{c['start']} ~ {c['end']}") for c in timeline["companies"]}
+        bad = [e for e in plan["experiences"] if e["kind"] == "work" and period_months(e["period"]) not in allowed]
+        if bad:
+            spans = ", ".join(f"'{c['start']} ~ {c['end']}'" for c in timeline["companies"])
+            problems.append("kind=work 경험 " + ", ".join(f"{e['experience_id']}('{e['period']}')" for e in bad)
+                            + f" 의 기간이 지정 재직 기간({spans})이 아님 → 지정 기간으로 바꾸거나 kind=project·activity 로")
     ids = [e["experience_id"] for e in plan["experiences"]]
     if len(set(ids)) != len(ids):
         problems.append("experience_id 중복")
