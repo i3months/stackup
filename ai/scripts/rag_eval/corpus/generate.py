@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -30,6 +31,7 @@ GEN_MODEL = "M-M"  # gemma-4-26B-A4B-it UD-Q4_K_M (P-008)
 TEMP_CREATIVE = 0.8  # 설계·문서 (다양성)
 TEMP_EXTRACT = 0.1  # 사실 추출
 ENGINEERING = {"backend", "frontend", "infra", "data", "mobile"}
+CAREER_BANDS = {"4~7", "8+"}  # 경력기술서 추가 (관리자 T03 답변 1)
 
 DOMAINS = ["이커머스", "핀테크·결제", "물류·배송", "헬스케어", "에듀테크", "게임", "미디어·콘텐츠", "공공·행정",
            "제조·스마트팩토리", "여행·숙박", "부동산·프롭테크", "모빌리티", "광고·마케팅 플랫폼", "SaaS·B2B 협업툴",
@@ -51,7 +53,7 @@ PLAN_SCHEMA = {
         "education": {"type": "string"},
         "certifications": {"type": "array", "items": {"type": "string"}},
         "experiences": {
-            "type": "array", "minItems": 4, "maxItems": 7,
+            "type": "array", "minItems": 6, "maxItems": 7,
             "items": {
                 "type": "object",
                 "properties": {
@@ -89,14 +91,15 @@ PLAN_SYSTEM = (
     "규칙:\n"
     "- 이름·회사·학교·서비스 이름은 모두 지어낸 것이어야 합니다. 실존 기업·실존 인물을 쓰지 마세요. "
     "연락처·이메일·주소·주민번호·전화번호는 넣지 마세요.\n"
-    "- 경험(experiences)은 4~7개. experience_id 는 E1, E2, ... 순서입니다.\n"
+    "- 경험(experiences)은 6~7개. experience_id 는 E1, E2, ... 순서입니다.\n"
     "- 모든 경험에는 검증 가능한 구체 값이 2개 이상 있어야 합니다: 수치(%, 건, ms, 명, 원, 배), 기간, 규모, "
     "도구와 버전, 설정값, 고유 이름(시스템·기능·캠페인 이름) 등. '성능을 개선했다' 같은 모호한 문장만으로 된 경험은 안 됩니다.\n"
     "- **혼동 경험 쌍(confusable_pairs)을 2쌍 이상** 만드세요. 한 쌍의 두 경험은 같은 도구·같은 주제·같은 종류의 지표를 "
     "다루지만 목적·맥락·수치가 서로 다릅니다 (예: 두 프로젝트 모두 Redis 를 썼지만 하나는 세션 저장, 하나는 재고 분산 락이고 "
     "수치도 다름). shared 에 공통점, difference 에 차이를 적습니다.\n"
-    "- 오늘은 2026년 10월입니다. years_of_experience 는 주어진 연차 범위 안의 정수이고, 정규직 경력 기간의 합이 "
-    "그 값과 맞아야 합니다 (진행 중인 경력은 '~ 현재'). 신입이면 회사 정규직 경력 없이 인턴·부트캠프·학교·개인 프로젝트로 구성합니다.\n"
+    "- 오늘은 2026년 10월입니다. 먼저 연차 N(주어진 범위 안의 정수)을 정하고, kind=work 경험들의 기간(YYYY.MM ~ YYYY.MM, "
+    "진행 중이면 '~ 현재')을 더한 합계가 N년 ± 6개월이 되도록 시작·종료 연월을 거꾸로 계산해 정하세요. "
+    "years_of_experience 와 headline 의 'N년차' 는 같은 N 입니다. 신입이면 회사 정규직 경력 없이 인턴·부트캠프·학교·개인 프로젝트로 구성합니다.\n"
     "- 직무가 개발이 아니면 기술 스택 대신 그 직무의 실무 도구·역량(예: GA4, Figma, Jira, SQL, A/B 테스트)을 씁니다.\n"
     "- 한국어로 쓰고, 기술 용어는 영문 원어를 그대로 둡니다."
 )
@@ -178,6 +181,23 @@ COVER_SYSTEM = (
 def cover_prompt(plan: dict[str, Any]) -> list[dict[str, str]]:
     user = "설계서:\n" + json.dumps(plan, ensure_ascii=False, indent=1) + "\n\n자기소개서를 JSON 으로 출력하세요."
     return [{"role": "system", "content": COVER_SYSTEM}, {"role": "user", "content": user}]
+
+
+CAREER_SYSTEM = (
+    "당신은 경력직 구직자 본인이 되어 한국어 경력기술서를 씁니다. 경력기술서는 이력서보다 자세하게 회사·프로젝트별로 "
+    "무엇을 왜 어떻게 했는지 적는 문서입니다. 설계서의 경력(work) 경험과 주요 프로젝트를 모두 다루고, 설계서의 구체 값을 "
+    "그대로 쓰되 이력서에 없을 법한 세부(문제 상황, 기술 선택 이유, 구현 방식, 협업 방식, 측정 방법)를 덧붙입니다. "
+    "설계서와 모순되는 새 수치는 쓰지 않습니다. 연락처·이메일·주소는 쓰지 않습니다."
+)
+
+
+def career_prompt(plan: dict[str, Any]) -> list[dict[str, str]]:
+    user = (
+        "형식: 첫 줄 '# 경력기술서 — <이름> (<headline>)'. 회사마다 '## 회사 — 직무 (기간)', 그 아래 프로젝트마다 "
+        "'### 프로젝트 이름 (기간)' 과 '- 역할:', '- 사용 기술:', '- 배경:', '- 주요 업무:'(불릿 여러 개), '- 성과:'(불릿) 항목. "
+        "분량은 3,000~5,000자.\n\n설계서:\n" + json.dumps(plan, ensure_ascii=False, indent=1) + "\n\n경력기술서 본문만 출력하세요."
+    )
+    return [{"role": "system", "content": CAREER_SYSTEM}, {"role": "user", "content": user}]
 
 
 def _java_trim(s: str) -> str:
@@ -278,8 +298,12 @@ class Generator:
         domain = random.Random(seed).choice(DOMAINS)
         used = sorted({json.loads(q.read_text(encoding="utf-8"))["name"]
                        for q in (self.corpus / "work").glob("*/plan.json") if q.parent.name != slot["persona_id"]})
-        for attempt in range(3):
-            plan = self.llm.chat_json(plan_prompt(slot, domain, repo, readme, used), schema=PLAN_SCHEMA,
+        problems: list[str] = []
+        for attempt in range(4):
+            msgs = plan_prompt(slot, domain, repo, readme, used)
+            if problems:
+                msgs[-1]["content"] += "\n\n이전 시도의 문제 (반드시 고칠 것): " + "; ".join(problems)
+            plan = self.llm.chat_json(msgs, schema=PLAN_SCHEMA,
                                       seed=seed + 100 * attempt, temperature=TEMP_CREATIVE, tag=f"{slot['persona_id']}-plan")
             problems = validate_plan(plan, need_repo=repo is not None, band=slot['years_band'])
             if plan["name"] in used:
@@ -309,6 +333,14 @@ class Generator:
         if p.exists():
             return p.read_text(encoding="utf-8")
         text = self.llm.chat(resume_prompt(plan), seed=seed, temperature=TEMP_CREATIVE, tag=f"{pid}-resume").strip() + "\n"
+        p.write_text(text, encoding="utf-8")
+        return text
+
+    def career(self, pid: str, plan: dict[str, Any], seed: int) -> str:
+        p = self.work(pid) / "career.md"
+        if p.exists():
+            return p.read_text(encoding="utf-8")
+        text = self.llm.chat(career_prompt(plan), seed=seed, temperature=TEMP_CREATIVE, tag=f"{pid}-career").strip() + "\n"
         p.write_text(text, encoding="utf-8")
         return text
 
@@ -415,6 +447,11 @@ class Generator:
         cover = self.cover(pid, plan, seed + 2)
         docs.append({"doc_id": f"{pid}-cover", "doc_type": "cover_letter", "source_type": "COVER_LETTER", "text": cover,
                      "source": "synthetic", "seed": seed + 2})
+        if slot["years_band"] in CAREER_BANDS:
+            career = self.career(pid, plan, seed + 3)
+            # 경력기술서는 운영에서 이력서 PDF 슬롯으로 올라간다 (source_type PDF)
+            docs.append({"doc_id": f"{pid}-career", "doc_type": "career_description", "source_type": "PDF",
+                         "text": career, "source": "synthetic", "seed": seed + 3})
         if slot["job_family"] in ENGINEERING:
             repo = self.repos[pid]
             text, meta = self.repo_text(pid, repo)
@@ -453,17 +490,72 @@ def check_evidence(text: str, ev: str) -> str:
 
 
 BAND_RANGE = {"신입": (0, 0), "1~3": (1, 3), "4~7": (4, 7), "8+": (8, 40)}
+NOW = (2026, 10)
+_YM = re.compile(r"(\d{4})\s*[.\-/년]\s*(\d{1,2})")
+_PRESENT = re.compile(r"현재|재직|present|now", re.I)
+
+
+def period_months(period: str) -> tuple[int, int] | None:
+    """'2021.03 ~ 현재' → (시작 월 번호, 끝 월 번호). 해석 못 하면 None."""
+    ym = _YM.findall(period)
+    if not ym:
+        return None
+    start = int(ym[0][0]) * 12 + int(ym[0][1]) - 1
+    if len(ym) >= 2:
+        end = int(ym[1][0]) * 12 + int(ym[1][1]) - 1
+    elif _PRESENT.search(period):
+        end = NOW[0] * 12 + NOW[1] - 1
+    else:
+        return None
+    return start, end + 1
+
+
+def career_years(plan: dict[str, Any]) -> float | None:
+    """kind=work 경험 기간의 합집합 (겹치는 기간은 한 번만). 해석 실패 시 None."""
+    spans = []
+    for e in plan["experiences"]:
+        if e["kind"] != "work":
+            continue
+        pm = period_months(e["period"])
+        if pm is None:
+            return None
+        spans.append(pm)
+    months, cur = 0, None
+    for a, b in sorted(spans):
+        if cur is None or a > cur[1]:
+            if cur:
+                months += cur[1] - cur[0]
+            cur = [a, b]
+        else:
+            cur[1] = max(cur[1], b)
+    if cur:
+        months += cur[1] - cur[0]
+    return months / 12
 
 
 def validate_plan(plan: dict[str, Any], *, need_repo: bool, band: str) -> list[str]:
+    """연차 구간은 경력 합계로 판단하고, 합계와 years_of_experience(headline) 차이는 1년 이내 (관리자 T03 답변 3)."""
     problems = []
     lo, hi = BAND_RANGE[band]
-    if not lo <= plan["years_of_experience"] <= hi:
-        problems.append(f"years_of_experience {plan['years_of_experience']} 가 {band} 범위 밖")
+    cy = career_years(plan)
+    n = plan["years_of_experience"]
+    m = re.search(r"(\d+)\s*년차", plan["headline"])
+    if cy is None:
+        problems.append("경력 기간 해석 실패")
+    elif band == "신입":
+        if cy >= 1.0 or n != 0:
+            problems.append(f"신입인데 정규 경력 {cy:.1f}년 / years {n}")
+    else:
+        if not lo <= cy < hi + 1:
+            problems.append(f"경력 합계 {cy:.1f}년이 {band} 범위 밖")
+        if abs(cy - n) > 1.0:
+            problems.append(f"경력 합계 {cy:.1f}년과 연차 {n}년 차이 > 1년")
+        if not m or int(m.group(1)) != n:
+            problems.append(f"headline '{plan['headline']}' 의 연차가 {n} 과 다름")
     ids = [e["experience_id"] for e in plan["experiences"]]
     if len(set(ids)) != len(ids):
         problems.append("experience_id 중복")
-    if not 4 <= len(ids) <= 7:
+    if not 6 <= len(ids) <= 7:
         problems.append(f"경험 {len(ids)}개")
     pairs = [cp for cp in plan["confusable_pairs"] if cp["a"] in ids and cp["b"] in ids and cp["a"] != cp["b"]]
     if len(pairs) < 2:
@@ -471,6 +563,21 @@ def validate_plan(plan: dict[str, Any], *, need_repo: bool, band: str) -> list[s
     if need_repo and plan["repo_experience_id"] not in ids:
         problems.append("repo_experience_id 가 경험 목록에 없음")
     return problems
+
+
+MIN_WINDOWS_FREE_GB = 8.0  # 관리자 규칙 (P-015 이후)
+
+
+def windows_free_gb() -> float | None:
+    import subprocess  # noqa: PLC0415
+
+    try:
+        out = subprocess.run(["powershell.exe", "-NoProfile", "-Command",
+                              "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        return int(out) / 1024 / 1024
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def load_slots() -> list[dict[str, str]]:
@@ -492,6 +599,10 @@ def main() -> None:
     llm = LocalLLM(base_url(GEN_MODEL), model=GEN_MODEL, log_path=results_dir("E1-corpus") / "work" / "calls.jsonl")
     gen = Generator(llm, repos=repos)
     for s in want:
+        free = windows_free_gb()
+        if free is not None and free < MIN_WINDOWS_FREE_GB:
+            print(f"STOP Windows 여유 메모리 {free:.1f}GB < {MIN_WINDOWS_FREE_GB}GB — 관리자 보고 필요", flush=True)
+            sys.exit(3)
         idx = int(s["persona_id"][1:])
         print(f"== {s['persona_id']} {s['job_role']} {s['years_band']}", flush=True)
         try:

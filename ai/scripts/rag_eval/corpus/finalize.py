@@ -116,7 +116,7 @@ def run_preserve(pids: list[str], *, batch: bool) -> dict[str, Any]:
         for f in facts:
             by_type[f["doc_id"].split("-", 1)[1]].append(f)
         for t, fs in by_type.items():
-            name = {"resume": "resume", "cover": "cover_letter", "repo": "repo"}[t]
+            name = {"resume": "resume", "cover": "cover_letter", "repo": "repo", "career": "career_description"}[t]
             (_corpus() / "work" / pid / f"facts-{name}.json").write_text(json.dumps(fs, ensure_ascii=False, indent=1),
                                                                          encoding="utf-8")
     return {"requests": len(reqs), "missing_judgments": missing, "task_spent_usd": round(lab.spent_usd(), 6)}
