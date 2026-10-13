@@ -78,22 +78,32 @@ def git_commit(repo: Path) -> str:
         "git", "-c", f"safe.directory={repo}", "-c", "core.filemode=false",
         "-c", "core.autocrlf=true", "-C", str(repo),
     ]
-    try:
-        out = subprocess.run(
-            [*git, "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            [*git, "status", "--porcelain", "--untracked-files=no"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        return out + ("-dirty" if dirty else "")
-    except Exception:  # noqa: BLE001
-        return "unknown"
+    # git worktree 는 .git 파일이 Windows 경로(C:/...)를 가리켜 리눅스 git 이 못 읽는다 → Windows git.exe 로 다시 시도
+    candidates = [git]
+    if str(repo).startswith("/mnt/"):
+        try:
+            win = subprocess.run(["wslpath", "-w", str(repo)], capture_output=True, text=True, check=True).stdout.strip()
+            candidates.append(["git.exe", "-C", win])
+        except Exception:  # noqa: BLE001
+            pass
+    for cmd in candidates:
+        try:
+            out = subprocess.run(
+                [*cmd, "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            dirty = subprocess.run(
+                [*cmd, "status", "--porcelain", "--untracked-files=no"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            return out + ("-dirty" if dirty else "")
+        except Exception:  # noqa: BLE001
+            continue
+    return "unknown"
 
 
 def stackup_commit() -> str:
