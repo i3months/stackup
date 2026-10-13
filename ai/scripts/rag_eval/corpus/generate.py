@@ -114,8 +114,11 @@ def _repo_block(repo: dict[str, Any] | None, readme: str) -> str:
     )
 
 
-def plan_prompt(slot: dict[str, str], domain: str, repo: dict[str, Any] | None, readme: str) -> list[dict[str, str]]:
+def plan_prompt(slot: dict[str, str], domain: str, repo: dict[str, Any] | None, readme: str,
+                used_names: list[str] | None = None) -> list[dict[str, str]]:
+    avoid = f"이미 다른 지원자가 쓴 이름이라 쓰면 안 되는 이름: {', '.join(used_names)}\n" if used_names else ""
     user = (
+        avoid +
         f"직무: {ROLE_KO[slot['job_role']]} (운영 직군 코드 {slot['job_role']})\n"
         f"연차: {YEARS_HINT[slot['years_band']]}\n"
         f"주력 산업 도메인: {domain} (경험의 절반 이상을 이 도메인으로)\n\n"
@@ -273,10 +276,14 @@ class Generator:
             text, _ = self.repo_text(slot["persona_id"], repo)
             readme = text.split("\n## README\n", 1)[-1].split("\n## File tree", 1)[0] if "## README" in text else ""
         domain = random.Random(seed).choice(DOMAINS)
+        used = sorted({json.loads(q.read_text(encoding="utf-8"))["name"]
+                       for q in (self.corpus / "work").glob("*/plan.json") if q.parent.name != slot["persona_id"]})
         for attempt in range(3):
-            plan = self.llm.chat_json(plan_prompt(slot, domain, repo, readme), schema=PLAN_SCHEMA,
+            plan = self.llm.chat_json(plan_prompt(slot, domain, repo, readme, used), schema=PLAN_SCHEMA,
                                       seed=seed + 100 * attempt, temperature=TEMP_CREATIVE, tag=f"{slot['persona_id']}-plan")
             problems = validate_plan(plan, need_repo=repo is not None, band=slot['years_band'])
+            if plan["name"] in used:
+                problems.append(f"이름 {plan['name']} 중복")
             if not problems:
                 break
             print(f"  plan 재시도 {attempt + 1}: {problems}")
