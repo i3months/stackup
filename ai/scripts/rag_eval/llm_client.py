@@ -31,14 +31,18 @@ import anthropic
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.messages.batch_create_params import Request
 
-# 백만 토큰당 USD. 단가가 바뀌면 PRICES 와 PRICE_VERSION 을 같이 고친다 —
+# 백만 토큰당 USD. 출처: https://platform.claude.com/docs/en/about-claude/pricing (2026-10-14 확인).
+# 단가가 바뀌면 PRICES 와 PRICE_VERSION 을 같이 고친다 —
 # 원장의 price_version 으로 어떤 단가표로 계산했는지 식별한다 (SPEC §9.3).
-# 캐시 쓰기: 5분 TTL 1.25x, 1시간 TTL 2x (입력 단가 기준). Batch: 모든 토큰 50% 할인.
-# Haiku 5.5 는 프롬프트가 10만 토큰을 넘으면 $0.50/$2.50 단가가 적용된다.
-PRICE_VERSION = "anthropic-2026-10-a"
+# - 캐시 쓰기: 5분 TTL 1.25x, 1시간 TTL 2x (입력 단가 기준).
+# - 캐시 읽기: Haiku 0.1x, Opus 5.5·Sonnet 5.5 는 0.05x (공식 표의 각주 2) — 그래서 배율이 아니라 값으로 둔다.
+# - Batch: 캐시 포함 모든 토큰 50% 할인 (할인끼리 곱해진다).
+# - Haiku 5.5 는 프롬프트(입력 + 캐시 읽기 + 캐시 쓰기)가 100,000 토큰을 넘는 요청에 $0.50/$2.50 단가표를 쓴다
+#   (같은 문서 "Long context pricing").
+PRICE_VERSION = "anthropic-2026-10-b"
 PRICES: dict[str, dict[str, float]] = {
     "claude-haiku-5-5": {"input": 0.10, "output": 0.50, "cache_read": 0.01},
-    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00, "cache_read": 0.20},
+    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00, "cache_read": 0.10},
     "claude-opus-5-5": {"input": 4.00, "output": 20.00, "cache_read": 0.20},
 }
 _LONG_PROMPT_TOKENS = 100_000
@@ -174,21 +178,39 @@ class LabClient:
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = client if client is not None else anthropic.Anthropic()
         self.commit = stackup_commit()
+        # 원장 증분 집계: 마지막으로 읽은 바이트 오프셋 이후만 읽는다. 다른 프로세스가 덧붙인 줄도
+        # 다음 _sync 에서 반영된다. 파일이 줄었으면(교체·잘림) 처음부터 다시 읽는다.
+        self._offset = 0
+        self._spent: dict[str, float] = {}
+        self._batch_keys: dict[str, set[str]] = {}
 
     # ---- 원장 ---------------------------------------------------------------
+    def _sync(self) -> None:
+        try:
+            size = self.ledger_path.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        if size < self._offset:
+            self._offset, self._spent, self._batch_keys = 0, {}, {}
+        if size == self._offset:
+            return
+        with self.ledger_path.open("rb") as fh:
+            fh.seek(self._offset)
+            data = fh.read(size - self._offset)
+        end = data.rfind(b"\n") + 1  # 쓰는 중인 마지막 줄(개행 없음)은 다음에 읽는다
+        for line in data[:end].splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            tid = rec.get("task_id")
+            self._spent[tid] = self._spent.get(tid, 0.0) + rec.get("cost_usd", 0.0)
+            if rec.get("batch_id"):
+                self._batch_keys.setdefault(rec["batch_id"], set()).add(rec.get("custom_id"))
+        self._offset += end
+
     def spent_usd(self, task_id: str | None = None) -> float:
-        tid = task_id or self.task_id
-        if not self.ledger_path.exists():
-            return 0.0
-        total = 0.0
-        with self.ledger_path.open(encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                rec = json.loads(line)
-                if rec.get("task_id") == tid:
-                    total += rec.get("cost_usd", 0.0)
-        return total
+        self._sync()
+        return self._spent.get(task_id or self.task_id, 0.0)
 
     @property
     def stop_at_usd(self) -> float:
@@ -229,6 +251,7 @@ class LabClient:
             "cache_write_1h_tokens": usage.cache_write_1h,
             "cache_read_tokens": usage.cache_read,
             "output_tokens": usage.output_tokens,
+            "prompt_tokens": usage.prompt_tokens,  # Haiku 단가표 분기(10만 토큰) 근거
             "stop_reason": stop_reason,
             "price_version": PRICE_VERSION,
             "cost_usd": round(cost_usd(model, usage, batch=batch), 8),
@@ -328,17 +351,8 @@ class LabClient:
         return out
 
     def _ledger_batch_keys(self, batch_id: str) -> set[str]:
-        if not self.ledger_path.exists():
-            return set()
-        keys = set()
-        with self.ledger_path.open(encoding="utf-8") as fh:
-            for line in fh:
-                if line.strip():
-                    rec = json.loads(line)
-                    if rec.get("batch_id") == batch_id:
-                        keys.add(rec.get("custom_id"))
-        return keys
-
+        self._sync()
+        return set(self._batch_keys.get(batch_id, ()))
 
 def text_of(msg: Any) -> str:
     return "".join(b.text for b in msg.content if b.type == "text")

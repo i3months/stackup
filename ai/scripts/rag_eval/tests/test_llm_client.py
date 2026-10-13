@@ -102,9 +102,50 @@ def test_cost_hand_calculated():
     assert cost_usd("claude-haiku-5-5", u, batch=True) == pytest.approx(expected / 2)
 
 
-def test_haiku_long_prompt_tier():
-    u = Usage(input_tokens=100_001, output_tokens=0)
-    assert cost_usd("claude-haiku-5-5", u, batch=False) == pytest.approx(100_001 * 0.50 / 1e6)
+# 공식 가격표(https://platform.claude.com/docs/en/about-claude/pricing, 2026-10-14)를 그대로 옮긴 기대값.
+# (입력, 5분 캐시 쓰기, 1시간 캐시 쓰기, 캐시 읽기, 출력) $/MTok — 표에 적힌 값 자체를 쓴다(배율로 다시 계산하지 않음).
+OFFICIAL = {
+    "claude-haiku-5-5": (0.10, 0.125, 0.20, 0.01, 0.50),
+    "claude-sonnet-5-5": (2.00, 2.50, 4.00, 0.10, 10.00),
+    "claude-opus-5-5": (4.00, 5.00, 8.00, 0.20, 20.00),
+}
+HAIKU_OVER_100K = (0.50, 0.625, 1.00, 0.05, 2.50)
+
+
+@pytest.mark.parametrize("model", sorted(OFFICIAL))
+@pytest.mark.parametrize("field", range(5))
+@pytest.mark.parametrize("batch", [False, True])
+def test_unit_price_matches_official_table(model, field, batch):
+    # 토큰 종류 하나만 n 개 → 비용 = 단가 × n / 1M (Batch 는 절반).
+    # 프롬프트 쪽은 Haiku 기본 단가표 범위(≤ 100K)에 들도록 100K, 출력은 프롬프트 길이에 안 들어가 1M.
+    kw = ["input_tokens", "cache_write_5m", "cache_write_1h", "cache_read", "output_tokens"][field]
+    n = 1_000_000 if field == 4 else 100_000
+    u = Usage(**{kw: n})
+    expected = OFFICIAL[model][field] * n / 1e6 * (0.5 if batch else 1.0)
+    assert cost_usd(model, u, batch=batch) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("field", range(5))
+def test_haiku_over_100k_table(field):
+    # 프롬프트 길이 = 입력 + 캐시 쓰기 + 캐시 읽기. 120K 프롬프트 중 해당 종류 100K + 입력 20K 로 구성.
+    kw = ["input_tokens", "cache_write_5m", "cache_write_1h", "cache_read", "output_tokens"][field]
+    u = Usage(input_tokens=120_000) if field in (0, 4) else Usage(input_tokens=20_000, **{kw: 100_000})
+    if field == 4:
+        u.output_tokens = 1_000_000
+    p = HAIKU_OVER_100K
+    expected = (u.input_tokens * p[0] + u.cache_write_5m * p[1] + u.cache_write_1h * p[2]
+                + u.cache_read * p[3] + u.output_tokens * p[4]) / 1e6
+    assert u.prompt_tokens > 100_000
+    assert cost_usd("claude-haiku-5-5", u, batch=False) == pytest.approx(expected)
+
+
+def test_haiku_threshold_counts_cache_tokens():
+    # 입력만으로는 10만 이하지만 캐시 읽기까지 합치면 초과 → 높은 단가표
+    under = Usage(input_tokens=100_000)
+    over = Usage(input_tokens=60_000, cache_read=40_001)
+    assert cost_usd("claude-haiku-5-5", under, batch=False) == pytest.approx(100_000 * 0.10 / 1e6)
+    assert cost_usd("claude-haiku-5-5", over, batch=False) == pytest.approx(
+        (60_000 * 0.50 + 40_001 * 0.05) / 1e6)
 
 
 def test_unknown_model_rejected():
@@ -190,6 +231,56 @@ def test_batch_ledger_rows_and_idempotent_collect(tmp_path):
         assert rec["batch"] is True and rec["batch_id"] == bid and rec["request_id"] is None
         assert rec["cost_usd"] == pytest.approx(0.0001)  # 50% 할인
     assert {r["custom_id"] for r in rows} == {"a", "b"}
+
+
+def test_ledger_read_incrementally(tmp_path):
+    lab = _lab(tmp_path)
+    for _ in range(3):
+        lab.call(model="claude-haiku-5-5", max_tokens=10, messages=[])
+    assert lab.spent_usd() == pytest.approx(0.0006)
+    off = lab._offset  # noqa: SLF001
+    assert off == (tmp_path / "results" / "_ledger.jsonl").stat().st_size
+    lab.call(model="claude-haiku-5-5", max_tokens=10, messages=[])
+    lab.spent_usd()
+    assert lab._offset > off  # 새 줄만 읽었다  # noqa: SLF001
+    assert lab.spent_usd() == pytest.approx(0.0008)
+
+
+def test_other_process_appends_are_seen(tmp_path):
+    lab = _lab(tmp_path)
+    lab.call(model="claude-haiku-5-5", max_tokens=10, messages=[])
+    assert lab.spent_usd() == pytest.approx(0.0002)
+    other = _lab(tmp_path)  # 다른 프로세스 역할
+    other.call(model="claude-haiku-5-5", max_tokens=10, messages=[])
+    assert lab.spent_usd() == pytest.approx(0.0004)
+
+
+def test_partial_last_line_is_deferred(tmp_path):
+    lab = _lab(tmp_path)
+    lab.call(model="claude-haiku-5-5", max_tokens=10, messages=[])
+    path = tmp_path / "results" / "_ledger.jsonl"
+    line = json.dumps({"task_id": "T-test", "cost_usd": 1.0})
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line[:10])  # 다른 프로세스가 쓰는 중
+    assert lab.spent_usd() == pytest.approx(0.0002)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line[10:] + "\n")
+    assert lab.spent_usd() == pytest.approx(1.0002)
+
+
+def test_ledger_replaced_is_reread(tmp_path):
+    lab = _lab(tmp_path)
+    for _ in range(2):
+        lab.call(model="claude-haiku-5-5", max_tokens=10, messages=[])
+    path = tmp_path / "results" / "_ledger.jsonl"
+    path.write_text(json.dumps({"task_id": "T-test", "cost_usd": 0.0001}) + "\n", encoding="utf-8")
+    assert lab.spent_usd() == pytest.approx(0.0001)
+
+
+def test_ledger_records_prompt_tokens(tmp_path):
+    lab = _lab(tmp_path, usage=_usage(inp=1000, cw5=10, cw1=20, cr=30))
+    lab.call(model="claude-haiku-5-5", max_tokens=10, messages=[])
+    assert _ledger(tmp_path)[0]["prompt_tokens"] == 1060
 
 
 def test_usage_without_ttl_breakdown_counts_as_5m():
