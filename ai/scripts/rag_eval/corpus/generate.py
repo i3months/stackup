@@ -117,13 +117,50 @@ def _repo_block(repo: dict[str, Any] | None, readme: str) -> str:
     )
 
 
+def _ym(m: int) -> str:
+    return f"{m // 12}.{m % 12 + 1:02d}"
+
+
+def career_timeline(band: str, seed: int) -> dict[str, Any]:
+    """연차 N 과 회사별 재직 기간을 코드가 정한다 — M-M 이 날짜 합계를 자주 틀려서 (T03 P02: 4회 연속 실패).
+    회사 기간은 이어지고 마지막 회사는 '현재'(2026.10)까지. 합계 = N년 ± 3개월, 연차 구간 안."""
+    rng = random.Random(seed + 7)
+    if band == "신입":
+        return {"years": 0, "companies": []}
+    lo, hi = BAND_RANGE[band]
+    n = rng.randint(lo, min(hi, 14))
+    months = min(max(n * 12 + rng.randint(-3, 3), lo * 12 + 1), (hi + 1) * 12 - 1)
+    k = 1 if n <= 3 else (2 if n <= 7 else 3)
+    w = [rng.uniform(0.6, 1.4) for _ in range(k)]
+    parts = [max(12, round(months * x / sum(w))) for x in w]
+    parts[-1] = months - sum(parts[:-1])
+    end = NOW[0] * 12 + NOW[1] - 1  # 이번 달까지 재직 (끝 월 포함 → 길이 계산은 +1)
+    spans, cur = [], end + 1
+    for m in reversed(parts):
+        spans.append((cur - m, cur))
+        cur -= m
+    spans.reverse()
+    comps = [{"start": _ym(a), "end": "현재" if i == len(spans) - 1 else _ym(b - 1)} for i, (a, b) in enumerate(spans)]
+    return {"years": n, "companies": comps}
+
+
 def plan_prompt(slot: dict[str, str], domain: str, repo: dict[str, Any] | None, readme: str,
-                used_names: list[str] | None = None) -> list[dict[str, str]]:
+                used_names: list[str] | None = None, timeline: dict[str, Any] | None = None) -> list[dict[str, str]]:
     avoid = f"이미 다른 지원자가 쓴 이름이라 쓰면 안 되는 이름: {', '.join(used_names)}\n" if used_names else ""
+    tl = timeline or {"years": 0, "companies": []}
+    if tl["companies"]:
+        comp = "\n".join(f"  - 회사 {i + 1}: {c['start']} ~ {c['end']}" for i, c in enumerate(tl["companies"]))
+        career = (f"연차: {tl['years']}년 (years_of_experience = {tl['years']}, headline 의 '{tl['years']}년차').\n"
+                  f"정규직 재직 기간은 정확히 다음과 같습니다 (회사 이름은 지어냄):\n{comp}\n"
+                  "kind=work 경험의 period 에는 그 경험이 속한 회사의 재직 기간을 위 표기 그대로 쓰세요. "
+                  "한 회사에서 work 경험이 여러 개면 같은 기간을 씁니다. 개인·사이드 프로젝트는 kind=project 로 둡니다.\n")
+    else:
+        career = ("연차: 신입 (years_of_experience = 0, headline 은 '<직무명>, 신입'). 정규직(kind=work) 경험은 만들지 마세요. "
+                  "인턴·부트캠프·동아리·학교 프로젝트는 kind=activity·project·education 으로 둡니다.\n")
     user = (
         avoid +
         f"직무: {ROLE_KO[slot['job_role']]} (운영 직군 코드 {slot['job_role']})\n"
-        f"연차: {YEARS_HINT[slot['years_band']]}\n"
+        + career +
         f"주력 산업 도메인: {domain} (경험의 절반 이상을 이 도메인으로)\n\n"
         f"{_repo_block(repo, readme)}\n\n"
         "headline 은 '<직무명>, <N>년차' (신입이면 '<직무명>, 신입') 형식의 짧은 한 줄입니다. 설계서 JSON 만 출력하세요."
@@ -299,8 +336,9 @@ class Generator:
         used = sorted({json.loads(q.read_text(encoding="utf-8"))["name"]
                        for q in (self.corpus / "work").glob("*/plan.json") if q.parent.name != slot["persona_id"]})
         problems: list[str] = []
+        timeline = career_timeline(slot["years_band"], seed)
         for attempt in range(4):
-            msgs = plan_prompt(slot, domain, repo, readme, used)
+            msgs = plan_prompt(slot, domain, repo, readme, used, timeline)
             if problems:
                 msgs[-1]["content"] += "\n\n이전 시도의 문제 (반드시 고칠 것): " + "; ".join(problems)
             plan = self.llm.chat_json(msgs, schema=PLAN_SCHEMA,
@@ -313,7 +351,8 @@ class Generator:
             print(f"  plan 재시도 {attempt + 1}: {problems}")
         else:
             raise RuntimeError(f"{slot['persona_id']} 설계서 검증 실패: {problems}")
-        plan["_meta"] = {"domain": domain, "seed": seed + 100 * attempt, "generator": GEN_MODEL, "attempts": attempt + 1}
+        plan["_meta"] = {"domain": domain, "seed": seed + 100 * attempt, "generator": GEN_MODEL, "attempts": attempt + 1,
+                         "timeline": timeline}
         p.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
         return plan
 
