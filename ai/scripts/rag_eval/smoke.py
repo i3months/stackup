@@ -241,10 +241,11 @@ def _seed_document(cur: Any, variant_id: str, summary: str) -> int:
     path = f"rag-eval/{variant_id}/{CASE_RESUME}.md"
     cur.execute("DELETE FROM analyzed_documents WHERE document_path = %s", (path,))
     cur.execute(
-        "INSERT INTO users (github_id, github_username, encrypted_github_access_token) "
-        "VALUES (%s, %s, %s) ON CONFLICT (github_id) DO UPDATE SET github_username = EXCLUDED.github_username "
-        "RETURNING id",
-        (900000001, "rag-eval-synthetic", "none"),
+        # 합성 사용자 1명. uq_users_github_id_active 가 부분 유니크 인덱스라 ON CONFLICT 에 WHERE 를 맞춘다.
+        "INSERT INTO users (github_id, github_username, encrypted_github_access_token, display_name) "
+        "VALUES (%s, %s, %s, %s) ON CONFLICT (github_id) WHERE is_deleted = false "
+        "DO UPDATE SET github_username = EXCLUDED.github_username RETURNING id",
+        (900000001, "rag-eval-synthetic", "none", "rag-eval-synthetic"),
     )
     uid = cur.fetchone()[0]
     cur.execute(
@@ -344,13 +345,18 @@ def _embed_and_search(mid: str, table: str, dim_col: int) -> None:
             pg_ver = cur.fetchone()[0]
             conn.commit()
 
-        sims = np.asarray(doc_vecs, dtype=np.float64) @ np.asarray(q_vec, dtype=np.float64)
+        # 내적이 아니라 코사인으로 비교한다 — bf16 로 정규화한 벡터는 노름이 1 에서 ~1e-3 벗어난다.
+        d64 = np.asarray(doc_vecs, dtype=np.float64)
+        q64 = np.asarray(q_vec, dtype=np.float64)
+        sims = (d64 @ q64) / (np.linalg.norm(d64, axis=1) * np.linalg.norm(q64))
+        norm_dev = float(np.max(np.abs(np.linalg.norm(d64, axis=1) - 1.0)))
         max_abs_diff = max(
             (abs((1 - float(sims[h[1]])) - float(h[3])) for h in hits if h[5] is not None), default=0.0
         )
         rr.rec["config"].update(embed_dim=dim, dtype=dtype, document_id=doc_id, postgres=pg_ver, pgvector=pgv)
         meta = {"query": query, "model_load_sec": round(load_sec, 2), "embed_sec": round(embed_sec, 3),
-                "cosine_max_abs_diff_numpy_vs_pg": max_abs_diff, **diag}
+                "cosine_max_abs_diff_numpy_vs_pg": max_abs_diff,
+                "doc_vec_norm_max_dev": norm_dev, **diag}
         rows = [meta] + [
             {"rank": i + 1, "doc_id": CASE_RESUME, "db_document_id": h[0], "chunk_index": h[1],
              "score_type": "rrf", "score": float(h[4]), "distance": float(h[3]),
@@ -546,9 +552,32 @@ def cmd_claude(args: argparse.Namespace) -> None:
     assert lab.spent_usd() < 1.0
 
 
+def cmd_env(_: argparse.Namespace) -> None:
+    """E0 환경 기록 results/E0-env/run.json — 확정 모델 8종, 서버 2종 설정, 스모크 결과 요약."""
+    from servers.llama_server import CTX, build_args
+
+    from common import llama_build
+
+    smoke = {}
+    for p in sorted(smoke_dir().glob("*.run.json")):
+        r = json.loads(p.read_text(encoding="utf-8"))
+        smoke[p.name.removesuffix(".run.json")] = {
+            "ok": r.get("ended_at") is not None and "error" not in r,
+            "stackup_commit": r["stackup_commit"], "ended_at": r["ended_at"]}
+    cfg = {"pg_dsn": PG_DSN_DEFAULT, "prod_embed_dim": PROD_EMBED_DIM, "rrf_k": RRF_K, "ctx": CTX, "smoke": smoke}
+    server = {"binary_build": llama_build(), "n_parallel": 1,
+              "args": {p: build_args(p, None) for p in ("M-S", "M-M")}}
+    with RunRecorder(results_dir(EXP + "-env"), run_id="E0-env", task_id=TASK_ID, experiment=EXP,
+                     condition_id=None, config=cfg, model_ids=list(MODELS), server=server,
+                     notes="T01 환경 기록. 스모크별 run.json 은 smoke/ 에 있다.") as rr:
+        rr.n_items = len(smoke)
+    print(json.dumps(smoke, ensure_ascii=False, indent=1))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("env")
     for n in ("chunk", "emb1", "emb4", "rerank"):
         sub.add_parser(n)
     g = sub.add_parser("generate")
@@ -561,7 +590,7 @@ def main() -> None:
     c.add_argument("--model", default="claude-haiku-5-5")
     c.add_argument("--batch-timeout", type=float, default=3600)
     a = ap.parse_args()
-    {"chunk": cmd_chunk, "emb1": cmd_emb1, "emb4": cmd_emb4, "rerank": cmd_rerank,
+    {"env": cmd_env, "chunk": cmd_chunk, "emb1": cmd_emb1, "emb4": cmd_emb4, "rerank": cmd_rerank,
      "generate": cmd_generate, "claude": cmd_claude}[a.cmd](a)
 
 

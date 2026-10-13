@@ -38,12 +38,15 @@ from common import (  # noqa: E402
 
 RUN_DIR = Path(os.environ.get("RAG_RUN_DIR", Path.home() / "rag-lab" / "run"))
 CTX = 16384
-# M-M 기본 N — bench-moe 실측(T01)으로 정한 값. 바꾸면 T01-report 와 같이 고친다.
-M_M_N_CPU_MOE_DEFAULT = int(os.environ.get("RAG_M_M_N_CPU_MOE", "20"))
+# M-M 기본 N — T01 bench-moe 실측(48GB, ctx 16384): N=14 에서 VRAM 11.6/12.0GB, 생성 14.4 tok/s.
+# N=12 가 더 빠르지만(17.2) 여유가 330MB 뿐이라 데스크톱 VRAM 변동에 취약하다. 바꾸면 T01-report 와 같이 고친다.
+M_M_N_CPU_MOE_DEFAULT = int(os.environ.get("RAG_M_M_N_CPU_MOE", "14"))
 
 PROFILES: dict[str, dict[str, Any]] = {
     "M-S": {"port": 8081, "extra": []},
-    "M-M": {"port": 8082, "extra": []},
+    # Gemma 4 템플릿은 생각(thinking) 모드가 기본으로 켜져 있어 운영 출력 상한 512 토큰을 생각에 다 쓴다
+    # (T01 스모크 5: 40초, 빈 질문). SPEC §5.2 thinking off 를 서버 기본값으로 건다 — 운영 클라이언트는 무변경.
+    "M-M": {"port": 8082, "extra": ["--chat-template-kwargs", '{"enable_thinking":false}']},
 }
 
 
