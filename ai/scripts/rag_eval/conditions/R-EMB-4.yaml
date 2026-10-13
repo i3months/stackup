@@ -1,0 +1,17 @@
+# R-EMB-4 — B0 에서 한 요인만 바꾼다 (SPEC §5.1 OFAT).
+condition_id: R-EMB-4
+description: "임베딩 Qwen3-Embedding-4B 2560차원 (bf16, d2560 테이블)"
+index_source: summary        # summary | raw | both
+chunk_size: 1000
+chunk_overlap: 200
+chunk_mode: recursive        # recursive (헤딩 → 크기) | heading (헤딩 단위만, 최대 chunk_size)
+prefix: deterministic        # deterministic | none | llm
+embedder: EMB-4              # common.MODELS
+query_instruction: query     # none | query (모델 카드 prompt_name="query")
+dtype: bf16                  # fp32 | bf16
+truncate_dim: null           # MRL 절단 차원 (R-EMB-4m 만)
+retrieval: hybrid_simple     # hybrid_simple | vector | hybrid_kiwi | bm25_kiwi
+cand: k                      # k | 4k | 정수
+reranker: none               # none | RR-1 | RR-2
+rerank_stage1: 20            # 재순위 1단계 cand = limit
+exploratory: false
