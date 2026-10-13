@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import results_dir  # noqa: E402
+from common import results_dir, stackup_commit  # noqa: E402
 from local_llm import LocalLLM, LocalLLMError  # noqa: E402
 
 BASE_SEED = 7000
@@ -352,7 +352,7 @@ class Generator:
         else:
             raise RuntimeError(f"{slot['persona_id']} 설계서 검증 실패: {problems}")
         plan["_meta"] = {"domain": domain, "seed": seed + 100 * attempt, "generator": GEN_MODEL, "attempts": attempt + 1,
-                         "timeline": timeline}
+                         "timeline": timeline, "generator_commit": stackup_commit()}
         p.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
         return plan
 

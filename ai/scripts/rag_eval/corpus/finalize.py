@@ -153,6 +153,9 @@ def compile_outputs(pids: list[str]) -> dict[str, Any]:
             pres[f["preserved_in_summary"]] += 1
             pres_by[f"doc:{f['doc_id'].split('-', 1)[1]}"][f["preserved_in_summary"]] += 1
             pres_by[f"type:{f['fact_type']}"][f["preserved_in_summary"]] += 1
+    gen_commit = {pid: dict(zip(("commit", "source"), generator_commit(pid))) for pid in pids}
+    for d in docs:
+        d["generator_commit"] = gen_commit[d["persona_id"]]["commit"]
     write_jsonl(corpus / "facts.jsonl", facts)
     slots = load_slots()
     for s in slots:
@@ -171,15 +174,27 @@ def compile_outputs(pids: list[str]) -> dict[str, Any]:
         "fact_types": dict(Counter(f["fact_type"] for f in facts)),
         "preserved": dict(pres),
         "preserved_rate_by": {k: {"full_rate": round(v["full"] / sum(v.values()), 3), **v} for k, v in sorted(pres_by.items())},
+        "personas_by_generator_commit": {c: sorted(p for p, v in gen_commit.items() if v["commit"] == c)
+                                         for c in sorted({v["commit"] for v in gen_commit.values()})},
         "chunks_per_persona": cc,
         "chunks_stats": {"min": min(cc.values()), "median": statistics.median(cc.values()), "max": max(cc.values())},
     }
     write_json(corpus / "manifest.json", {
         "created_at": now_iso(), "script": "ai/scripts/rag_eval/corpus/{generate,finalize}.py",
         "stackup_commit": stackup_commit(), "generator": GEN_MODEL, "seed_rule": "BASE_SEED 7000 + 번호×1000 + 단계 오프셋",
-        "preserve_judge": JUDGE, "stats": stats, "docs": docs,
+        "preserve_judge": JUDGE, "stats": stats, "generator_commit": gen_commit, "docs": docs,
     })
     return stats
+
+
+# 생성 도중 생성기 코드가 바뀌었다 (관리자 T03 답변). a11ea76 부터는 plan._meta 에 커밋을 남긴다.
+# 그 전 페르소나는 plan._meta 로 추정한다: timeline 이 있으면 0205187 (전체 실행 재시작 04:15 이후),
+# 없으면 aef8507 (P01, 04:15 이전 첫 실행). 두 실행 모두 작업 트리가 깨끗한 상태에서 시작했다.
+def generator_commit(pid: str) -> tuple[str, str]:
+    m = json.loads((_corpus() / "work" / pid / "plan.json").read_text(encoding="utf-8")).get("_meta", {})
+    if m.get("generator_commit"):
+        return m["generator_commit"], "recorded"
+    return ("0205187" if "timeline" in m else "aef8507"), "inferred"
 
 
 def _evidence_ok(f: dict[str, Any]) -> bool:
