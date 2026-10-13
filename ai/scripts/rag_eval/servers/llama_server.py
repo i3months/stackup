@@ -54,14 +54,14 @@ def base_url(profile: str) -> str:
     return f"http://127.0.0.1:{PROFILES[profile]['port']}"
 
 
-def build_args(profile: str, n_cpu_moe: int | None) -> list[str]:
+def build_args(profile: str, n_cpu_moe: int | None, ctx: int | None = None) -> list[str]:
     p = PROFILES[profile]
     args = [
         "-m", str(model_path(profile)),
         "--host", "127.0.0.1",
         "--port", str(p["port"]),
         "-ngl", "99",
-        "-c", str(CTX),
+        "-c", str(ctx or CTX),
         "-np", "1",
         "--jinja",
         "--alias", profile,
@@ -92,14 +92,14 @@ def _alive(pid: int) -> bool:
         return False
 
 
-def start(profile: str, n_cpu_moe: int | None = None, *, timeout: float = 900) -> dict[str, Any]:
+def start(profile: str, n_cpu_moe: int | None = None, *, ctx: int | None = None, timeout: float = 900) -> dict[str, Any]:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     st = _state_path(profile)
     if st.exists():
         old = json.loads(st.read_text())
         if _alive(old["pid"]):
             raise RuntimeError(f"{profile} 이미 실행 중 (pid {old['pid']}) — 먼저 stop")
-    args = build_args(profile, n_cpu_moe)
+    args = build_args(profile, n_cpu_moe, ctx)
     vram_before = gpu_mem_used_mib()
     log = RUN_DIR / f"{profile}.log"
     with log.open("w") as fh:
@@ -124,6 +124,7 @@ def start(profile: str, n_cpu_moe: int | None = None, *, timeout: float = 900) -
         "binary_build": llama_build(),
         "args": args,
         "n_parallel": 1,
+        "ctx": ctx or CTX,
         "n_cpu_moe": n_cpu_moe if profile == "M-M" and n_cpu_moe is not None
         else (M_M_N_CPU_MOE_DEFAULT if profile == "M-M" else None),
         "load_sec": round(time.monotonic() - t0, 1),
@@ -155,7 +156,7 @@ def stop(profile: str) -> None:
 def server_record(profile: str) -> dict[str, Any]:
     """run.json server 필드 (SPEC §9.3)."""
     st = json.loads(_state_path(profile).read_text())
-    return {k: st[k] for k in ("binary_build", "args", "n_parallel", "n_cpu_moe", "base_url")}
+    return {k: st.get(k) for k in ("binary_build", "args", "n_parallel", "n_cpu_moe", "ctx", "base_url")}
 
 
 def _complete(url: str, prompt: str, n_predict: int, seed: int = 1234) -> dict[str, Any]:
@@ -205,6 +206,7 @@ def main() -> None:
     s = sub.add_parser("start")
     s.add_argument("profile", choices=PROFILES)
     s.add_argument("--n-cpu-moe", type=int, default=None)
+    s.add_argument("--ctx", type=int, default=None)
     t = sub.add_parser("stop")
     t.add_argument("profile", choices=PROFILES)
     sub.add_parser("status")
@@ -212,7 +214,7 @@ def main() -> None:
     b.add_argument("--ns", default="30,26,22,20,18,16")
     a = ap.parse_args()
     if a.cmd == "start":
-        print(json.dumps(start(a.profile, a.n_cpu_moe), ensure_ascii=False, indent=1))
+        print(json.dumps(start(a.profile, a.n_cpu_moe, ctx=a.ctx), ensure_ascii=False, indent=1))
     elif a.cmd == "stop":
         stop(a.profile)
     elif a.cmd == "status":

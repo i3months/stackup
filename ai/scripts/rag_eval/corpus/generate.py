@@ -1,0 +1,498 @@
+"""E1a 코퍼스 생성 (T03): 페르소나 설계 → 이력서·자소서(·레포) → 사실 추출 → 운영 분석 요약.
+
+    python -m corpus.generate --personas P01,P21,P35      # 파일럿
+    python -m corpus.generate --all
+
+- 생성 모델은 M-M (llama-server, 생각 모드 끔). 서버는 미리 띄운다:
+  python servers/llama_server.py start M-M --ctx 32768
+- 단계마다 results/E1-corpus/work/<persona>/ 에 저장하고, 있으면 건너뛴다 (재실행 안전).
+- 시드: 페르소나 시드 = BASE_SEED + 번호, 단계마다 고정 오프셋 (재시도는 +100).
+- 문서는 docs/<persona>/<doc_id>.md, 분석 요약은 analysis/<doc_id>.md (+ .json).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import results_dir  # noqa: E402
+from local_llm import LocalLLM, LocalLLMError  # noqa: E402
+
+BASE_SEED = 7000
+GEN_MODEL = "M-M"  # gemma-4-26B-A4B-it UD-Q4_K_M (P-008)
+TEMP_CREATIVE = 0.8  # 설계·문서 (다양성)
+TEMP_EXTRACT = 0.1  # 사실 추출
+ENGINEERING = {"backend", "frontend", "infra", "data", "mobile"}
+
+DOMAINS = ["이커머스", "핀테크·결제", "물류·배송", "헬스케어", "에듀테크", "게임", "미디어·콘텐츠", "공공·행정",
+           "제조·스마트팩토리", "여행·숙박", "부동산·프롭테크", "모빌리티", "광고·마케팅 플랫폼", "SaaS·B2B 협업툴",
+           "보험", "통신", "식품·외식", "패션·리테일"]
+ROLE_KO = {"BACKEND": "백엔드 개발자", "FRONTEND": "프론트엔드 개발자", "INFRA": "인프라/DevOps 엔지니어",
+           "DATA_AI": "데이터 엔지니어/데이터 사이언티스트", "MOBILE": "모바일 앱 개발자",
+           "PLANNING": "서비스 기획자(PM)", "MARKETING": "마케터", "DESIGN": "프로덕트(UX/UI) 디자이너"}
+YEARS_HINT = {"신입": "경력 0년 (인턴·부트캠프·학교·개인 프로젝트 위주)", "1~3": "경력 1~3년",
+              "4~7": "경력 4~7년", "8+": "경력 8년 이상"}
+FACT_TYPES = ["number", "tool", "incident", "code", "role", "outcome"]
+
+# ---------------------------------------------------------------------------
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "headline": {"type": "string"},
+        "years_of_experience": {"type": "integer"},
+        "education": {"type": "string"},
+        "certifications": {"type": "array", "items": {"type": "string"}},
+        "experiences": {
+            "type": "array", "minItems": 4, "maxItems": 7,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "experience_id": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["work", "project", "activity", "education"]},
+                    "title": {"type": "string"},
+                    "org": {"type": "string"},
+                    "period": {"type": "string"},
+                    "context": {"type": "string"},
+                    "actions": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+                    "outcomes": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    "tools": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["experience_id", "kind", "title", "org", "period", "context", "actions", "outcomes", "tools"],
+            },
+        },
+        "confusable_pairs": {
+            "type": "array", "minItems": 2,
+            "items": {
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "string"},
+                               "shared": {"type": "string"}, "difference": {"type": "string"}},
+                "required": ["a", "b", "shared", "difference"],
+            },
+        },
+        "repo_experience_id": {"type": "string"},
+    },
+    "required": ["name", "headline", "years_of_experience", "education", "certifications", "experiences",
+                 "confusable_pairs", "repo_experience_id"],
+}
+
+PLAN_SYSTEM = (
+    "당신은 채용 연구용 합성 데이터를 설계하는 사람입니다. 실존하지 않는 한국인 구직자 한 명의 경력 설계서를 "
+    "JSON 으로 만듭니다. 이 데이터는 면접 질문 생성 연구의 평가용 코퍼스로 쓰입니다.\n"
+    "규칙:\n"
+    "- 이름·회사·학교·서비스 이름은 모두 지어낸 것이어야 합니다. 실존 기업·실존 인물을 쓰지 마세요. "
+    "연락처·이메일·주소·주민번호·전화번호는 넣지 마세요.\n"
+    "- 경험(experiences)은 4~7개. experience_id 는 E1, E2, ... 순서입니다.\n"
+    "- 모든 경험에는 검증 가능한 구체 값이 2개 이상 있어야 합니다: 수치(%, 건, ms, 명, 원, 배), 기간, 규모, "
+    "도구와 버전, 설정값, 고유 이름(시스템·기능·캠페인 이름) 등. '성능을 개선했다' 같은 모호한 문장만으로 된 경험은 안 됩니다.\n"
+    "- **혼동 경험 쌍(confusable_pairs)을 2쌍 이상** 만드세요. 한 쌍의 두 경험은 같은 도구·같은 주제·같은 종류의 지표를 "
+    "다루지만 목적·맥락·수치가 서로 다릅니다 (예: 두 프로젝트 모두 Redis 를 썼지만 하나는 세션 저장, 하나는 재고 분산 락이고 "
+    "수치도 다름). shared 에 공통점, difference 에 차이를 적습니다.\n"
+    "- 오늘은 2026년 10월입니다. years_of_experience 는 주어진 연차 범위 안의 정수이고, 정규직 경력 기간의 합이 "
+    "그 값과 맞아야 합니다 (진행 중인 경력은 '~ 현재'). 신입이면 회사 정규직 경력 없이 인턴·부트캠프·학교·개인 프로젝트로 구성합니다.\n"
+    "- 직무가 개발이 아니면 기술 스택 대신 그 직무의 실무 도구·역량(예: GA4, Figma, Jira, SQL, A/B 테스트)을 씁니다.\n"
+    "- 한국어로 쓰고, 기술 용어는 영문 원어를 그대로 둡니다."
+)
+
+
+def _repo_block(repo: dict[str, Any] | None, readme: str) -> str:
+    if not repo:
+        return "이 지원자는 개발 직군이 아니므로 공개 레포가 없습니다. repo_experience_id 는 빈 문자열로 둡니다."
+    return (
+        "이 지원자의 포트폴리오 GitHub 레포는 아래 공개 레포입니다 (지원자가 직접 만든 사이드 프로젝트로 설정합니다).\n"
+        f"- 레포: {repo['full_name']} ({repo.get('language') or '?'})\n- 설명: {repo.get('description') or ''}\n"
+        f"- README 앞부분:\n<<<\n{readme[:3000]}\n>>>\n"
+        "경험 하나를 이 레포 프로젝트로 만들고 그 experience_id 를 repo_experience_id 에 적으세요. 그 경험의 내용(기능·도구·수치)은 "
+        "README 와 모순되면 안 되며, README 에 없는 성과 수치를 지어낼 때는 개인 사용 맥락(예: 혼자 운영, 사용자 수)으로 한정하세요."
+    )
+
+
+def plan_prompt(slot: dict[str, str], domain: str, repo: dict[str, Any] | None, readme: str) -> list[dict[str, str]]:
+    user = (
+        f"직무: {ROLE_KO[slot['job_role']]} (운영 직군 코드 {slot['job_role']})\n"
+        f"연차: {YEARS_HINT[slot['years_band']]}\n"
+        f"주력 산업 도메인: {domain} (경험의 절반 이상을 이 도메인으로)\n\n"
+        f"{_repo_block(repo, readme)}\n\n"
+        "headline 은 '<직무명>, <N>년차' (신입이면 '<직무명>, 신입') 형식의 짧은 한 줄입니다. 설계서 JSON 만 출력하세요."
+    )
+    return [{"role": "system", "content": PLAN_SYSTEM}, {"role": "user", "content": user}]
+
+
+def _style_examples() -> str:
+    import cases  # noqa: PLC0415  (common.py 가 llm_eval 경로를 sys.path 에 넣는다)
+
+    return cases.RESUME_INFRA_DBA
+
+
+RESUME_SYSTEM = (
+    "당신은 구직자 본인이 되어 한국어 이력서를 씁니다. 이력서는 PDF 에서 텍스트를 추출한 것처럼 마크다운 헤딩과 불릿으로 된 "
+    "평문입니다. 주어진 설계서의 사실만 쓰고, 설계서의 모든 경험과 모든 구체 값(수치·도구·이름·기간)을 빠짐없이 그대로 넣습니다. "
+    "설계서에 없는 새 수치를 지어내지 마세요. 연락처·이메일·주소는 쓰지 마세요."
+)
+
+
+def resume_prompt(plan: dict[str, Any]) -> list[dict[str, str]]:
+    user = (
+        "아래 형식 예시는 **형식만** 참고하세요 (내용은 쓰지 마세요):\n<<<\n" + _style_examples() + "\n>>>\n\n"
+        "형식: 첫 줄 '# 이력서 — <이름> (<headline>)', 그 다음 '## 요약'(불릿 3개), '## 경력'(회사별 '### 회사 — 역할 (기간)' 아래 불릿), "
+        "'## 프로젝트'(프로젝트별 '### 이름 (기간)'), '## 기술 스택' 또는 '## 역량·도구', '## 학력·자격'. 해당 없는 절은 생략합니다.\n\n"
+        "설계서:\n" + json.dumps(plan, ensure_ascii=False, indent=1) + "\n\n이력서 본문만 출력하세요."
+    )
+    return [{"role": "system", "content": RESUME_SYSTEM}, {"role": "user", "content": user}]
+
+
+COVER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "items": {
+            "type": "array", "minItems": 3, "maxItems": 4,
+            "items": {"type": "object", "properties": {"question": {"type": "string"}, "answer": {"type": "string"}},
+                      "required": ["question", "answer"]},
+        },
+    },
+    "required": ["title", "items"],
+}
+COVER_SYSTEM = (
+    "당신은 구직자 본인이 되어 한국어 자기소개서를 씁니다. 국내 기업 자소서 문항(지원동기, 직무 역량을 보여 준 경험, "
+    "협업·갈등 해결, 실패·성장 경험, 입사 후 포부 중 3~4개)에 답합니다. 문항당 답변은 500~900자입니다.\n"
+    "- 설계서의 경험 중 3개 이상을 사용하고, 혼동 경험 쌍 중 최소 한 쌍의 두 경험을 서로 다른 문항에서 다룹니다.\n"
+    "- 경험을 쓸 때 설계서의 구체 값(수치·도구·이름)을 그대로 쓰고, 이력서에는 없을 법한 맥락(왜 그렇게 했는지, 무엇을 배웠는지, "
+    "누구와 어떻게 협업했는지)을 덧붙입니다. 설계서와 모순되는 새 수치는 쓰지 않습니다.\n"
+    "- title 은 '지원 회사 이름 + 직무 + 지원' 형태입니다 (예: 한빛로지스 백엔드 개발자 지원). 회사 이름은 지어내고 "
+    "꺾쇠·대괄호 없이 씁니다. 실존 기업 이름은 쓰지 않습니다.\n"
+    "- 연락처·이메일·주소는 쓰지 않습니다."
+)
+
+
+def cover_prompt(plan: dict[str, Any]) -> list[dict[str, str]]:
+    user = "설계서:\n" + json.dumps(plan, ensure_ascii=False, indent=1) + "\n\n자기소개서를 JSON 으로 출력하세요."
+    return [{"role": "system", "content": COVER_SYSTEM}, {"role": "user", "content": user}]
+
+
+def _java_trim(s: str) -> str:
+    # Java String.trim(): 양 끝의 코드포인트 <= U+0020 만 제거
+    i, j = 0, len(s)
+    while i < j and ord(s[i]) <= 0x20:
+        i += 1
+    while j > i and ord(s[j - 1]) <= 0x20:
+        j -= 1
+    return s[i:j]
+
+
+def build_cover_markdown(title: str, items: list[dict[str, str]]) -> str:
+    """Core AnalysisRequestService.buildMarkdown 의 파이썬 이식 (문항 JSON → 분석·임베딩용 마크다운)."""
+    sb = ["# 자기소개서"]
+    if title is not None and _java_trim(title):
+        sb.append(" — " + _java_trim(title))
+    sb.append("\n\n")
+    for it in items:
+        q = _java_trim(it.get("question") or "")
+        a = _java_trim(it.get("answer") or "")
+        if not a:
+            continue
+        sb.append("## " + (q or "문항") + "\n")
+        sb.append(a + "\n\n")
+    return "".join(sb)
+
+
+FACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "facts": {
+            "type": "array", "minItems": 6, "maxItems": 12,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "experience_id": {"type": "string"},
+                    "fact_type": {"type": "string", "enum": FACT_TYPES},
+                    "statement": {"type": "string"},
+                    "evidence_text": {"type": "string"},
+                },
+                "required": ["experience_id", "fact_type", "statement", "evidence_text"],
+            },
+        }
+    },
+    "required": ["facts"],
+}
+FACT_SYSTEM = (
+    "당신은 문서에서 검증 가능한 사실을 뽑는 사람입니다. 사실은 면접 질문과 검색 평가의 정답 기준이 됩니다.\n"
+    "규칙:\n"
+    "- 문서당 6~10개. 서로 다른 내용을 고르게 뽑습니다 (한 경험에 몰지 않음).\n"
+    "- 사실마다 **검증 가능한 값**(수치, 도구·버전, 설정값, 고유 이름, 기간, 역할)이 있어야 합니다. 모호한 사실 금지.\n"
+    "- evidence_text 는 문서에서 **글자 하나 바꾸지 않고 그대로 복사한 연속 구간**입니다 (15~120자, 줄바꿈 없이 한 줄 안에서). "
+    "사실의 핵심 값을 반드시 포함합니다. 요약·의역·생략 부호 금지.\n"
+    "- statement 는 그 사실을 한 문장으로 쓴 것입니다 (주어 생략 가능).\n"
+    "- experience_id 는 주어진 경험 목록에서 그 사실이 속한 경험의 ID 입니다. 어느 경험에도 속하지 않으면 'NONE'.\n"
+    "- fact_type: number(수치), tool(도구·기술), incident(사건·장애·문제), code(코드·설정·함수명·의존성), role(역할·책임), outcome(성과)."
+)
+
+
+def fact_prompt(doc_text: str, plan: dict[str, Any], doc_type: str, feedback: str = "") -> list[dict[str, str]]:
+    exps = "\n".join(f"- {e['experience_id']}: {e['title']} ({e['org']}, {e['period']})" for e in plan["experiences"])
+    extra = ""
+    if doc_type == "repo":
+        extra = ("\n이 문서는 GitHub 레포(README·파일 트리·소스 일부)입니다. README·코드에서 함수명, 설정값, 의존성과 버전, "
+                 f"명령어 같은 사실을 뽑고 experience_id 는 {plan['repo_experience_id']} 로 둡니다.")
+    user = f"경험 목록:\n{exps}{extra}\n\n문서:\n<<<\n{doc_text}\n>>>\n"
+    if feedback:
+        user += f"\n이전 시도의 문제:\n{feedback}\n문제를 고쳐 다시 뽑으세요.\n"
+    user += "\n사실 목록을 JSON 으로 출력하세요."
+    return [{"role": "system", "content": FACT_SYSTEM}, {"role": "user", "content": user}]
+
+
+# ---------------------------------------------------------------------------
+class Generator:
+    def __init__(self, llm: LocalLLM, *, repos: dict[str, dict[str, Any]]) -> None:
+        self.llm = llm
+        self.repos = repos
+        self.corpus = results_dir("E1-corpus")
+
+    def work(self, pid: str) -> Path:
+        d = self.corpus / "work" / pid
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    # ---- 단계 ----------------------------------------------------------------
+    def plan(self, slot: dict[str, str], seed: int) -> dict[str, Any]:
+        p = self.work(slot["persona_id"]) / "plan.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+        repo = self.repos.get(slot["persona_id"]) if slot["job_family"] in ENGINEERING else None
+        readme = ""
+        if repo:
+            from corpus.repo_source import build_repo_text  # noqa: PLC0415
+
+            text, _ = self.repo_text(slot["persona_id"], repo)
+            readme = text.split("\n## README\n", 1)[-1].split("\n## File tree", 1)[0] if "## README" in text else ""
+        domain = random.Random(seed).choice(DOMAINS)
+        for attempt in range(3):
+            plan = self.llm.chat_json(plan_prompt(slot, domain, repo, readme), schema=PLAN_SCHEMA,
+                                      seed=seed + 100 * attempt, temperature=TEMP_CREATIVE, tag=f"{slot['persona_id']}-plan")
+            problems = validate_plan(plan, need_repo=repo is not None, band=slot['years_band'])
+            if not problems:
+                break
+            print(f"  plan 재시도 {attempt + 1}: {problems}")
+        else:
+            raise RuntimeError(f"{slot['persona_id']} 설계서 검증 실패: {problems}")
+        plan["_meta"] = {"domain": domain, "seed": seed + 100 * attempt, "generator": GEN_MODEL, "attempts": attempt + 1}
+        p.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
+        return plan
+
+    def repo_text(self, pid: str, repo: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        p = self.work(pid) / "repo_source.json"
+        if p.exists():
+            d = json.loads(p.read_text(encoding="utf-8"))
+            return d["text"], d["meta"]
+        from corpus.repo_source import build_repo_text  # noqa: PLC0415
+
+        text, meta = build_repo_text(repo["full_name"], repo["commit"], repo["default_branch"], repo.get("description") or "")
+        p.write_text(json.dumps({"text": text, "meta": meta}, ensure_ascii=False), encoding="utf-8")
+        return text, meta
+
+    def resume(self, pid: str, plan: dict[str, Any], seed: int) -> str:
+        p = self.work(pid) / "resume.md"
+        if p.exists():
+            return p.read_text(encoding="utf-8")
+        text = self.llm.chat(resume_prompt(plan), seed=seed, temperature=TEMP_CREATIVE, tag=f"{pid}-resume").strip() + "\n"
+        p.write_text(text, encoding="utf-8")
+        return text
+
+    def cover(self, pid: str, plan: dict[str, Any], seed: int) -> str:
+        p = self.work(pid) / "cover.json"
+        if not p.exists():
+            d = self.llm.chat_json(cover_prompt(plan), schema=COVER_SCHEMA, seed=seed, temperature=TEMP_CREATIVE,
+                                   tag=f"{pid}-cover")
+            p.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return build_cover_markdown(d["title"], d["items"])
+
+    def facts(self, doc_id: str, doc_type: str, text: str, plan: dict[str, Any], seed: int) -> list[dict[str, Any]]:
+        pid = doc_id.split("-")[0]
+        p = self.work(pid) / f"facts-{doc_type}.json"
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+        valid_ids = {e["experience_id"] for e in plan["experiences"]} | {"NONE"}
+        kept: list[dict[str, Any]] = []
+        feedback = ""
+        for attempt in range(3):
+            raw = self.llm.chat_json(fact_prompt(text, plan, doc_type, feedback), schema=FACT_SCHEMA,
+                                     seed=seed + 100 * attempt, temperature=TEMP_EXTRACT, tag=f"{doc_id}-facts")
+            bad = []
+            for f in raw["facts"]:
+                ev = f["evidence_text"]
+                if any(ev == k["evidence_text"] for k in kept):
+                    continue
+                reason = check_evidence(text, ev)
+                if f["experience_id"] not in valid_ids:
+                    reason = reason or f"experience_id {f['experience_id']} 없음"
+                if reason:
+                    bad.append(f"- '{ev[:60]}': {reason}")
+                    continue
+                kept.append({**f, "attempt": attempt + 1})
+            if len(kept) >= 6:
+                break
+            feedback = (f"유효한 사실이 {len(kept)}개뿐입니다. 다음은 버려졌습니다:\n" + "\n".join(bad[:10])
+                        + "\n이미 채택된 근거와 다른 사실을 더 뽑으세요.")
+        kept = kept[:10]
+        out = []
+        for i, f in enumerate(kept, 1):
+            start = text.find(f["evidence_text"])
+            out.append({
+                "fact_id": f"{doc_id}-F{i:02d}", "persona_id": pid, "doc_id": doc_id,
+                "experience_id": None if f["experience_id"] == "NONE" else f["experience_id"],
+                "fact_type": f["fact_type"], "statement": f["statement"], "evidence_text": f["evidence_text"],
+                "char_start": start, "char_end": start + len(f["evidence_text"]),
+                "evidence_unique": text.count(f["evidence_text"]) == 1,
+                "preserved_in_summary": None, "generator": GEN_MODEL, "attempt": f["attempt"],
+            })
+        p.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        return out
+
+    def analyze(self, doc_id: str, source_type: str, text: str, seed: int) -> dict[str, Any]:
+        """운영 문서 분석 체인과 같은 프롬프트·온도·파서. LLM 만 M-M (B0 = 운영 구조 + 로컬 모델)."""
+        out_md = self.corpus / "analysis" / f"{doc_id}.md"
+        out_js = self.corpus / "analysis" / f"{doc_id}.json"
+        if out_js.exists():
+            return json.loads(out_js.read_text(encoding="utf-8"))
+        from langchain_core.output_parsers import PydanticOutputParser  # noqa: PLC0415
+        from langchain_core.prompts import ChatPromptTemplate  # noqa: PLC0415
+
+        from ai_server.chain.document_analysis_chain import DocumentAnalysisResult  # noqa: PLC0415
+        from ai_server.chain.prompts.document_analysis import HUMAN_PROMPT, SYSTEM_PROMPT  # noqa: PLC0415
+        from ai_server.config.settings import Settings  # noqa: PLC0415
+
+        s = Settings(_env_file=None)
+        parser = PydanticOutputParser(pydantic_object=DocumentAnalysisResult)
+        prompt = ChatPromptTemplate.from_messages([("system", SYSTEM_PROMPT), ("human", HUMAN_PROMPT)]).partial(
+            format_instructions=parser.get_format_instructions())
+        msgs = prompt.format_messages(text=text, source_type=source_type)
+        role = {"system": "system", "human": "user"}
+        messages = [{"role": role[m.type], "content": m.content} for m in msgs]
+        errors = []
+        for attempt in range(s.document_analysis_max_attempts):  # 운영 with_retry 와 같은 3회
+            raw = self.llm.chat(messages, seed=seed + 100 * attempt, temperature=s.llm_pro_temperature,
+                                tag=f"{doc_id}-analysis")
+            try:
+                res = parser.parse(raw)
+                break
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{type(exc).__name__}: {str(exc)[:200]}")
+        else:
+            raise RuntimeError(f"{doc_id} 분석 파싱 3회 실패: {errors}")
+        out_md.parent.mkdir(parents=True, exist_ok=True)
+        out_md.write_text(res.markdown, encoding="utf-8")
+        d = {"doc_id": doc_id, "source_type": source_type, "summary": res.summary, "tech_stack": res.tech_stack,
+             "generator": GEN_MODEL, "seed": seed + 100 * attempt, "attempts": attempt + 1, "parse_errors": errors,
+             "temperature": s.llm_pro_temperature, "prompt": "ai_server.chain.prompts.document_analysis"}
+        out_js.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+        return d
+
+    # ---- 페르소나 전체 ----------------------------------------------------------
+    def persona(self, slot: dict[str, str], idx: int) -> dict[str, Any]:
+        pid = slot["persona_id"]
+        seed = BASE_SEED + idx * 1000
+        t0 = time.monotonic()
+        plan = self.plan(slot, seed)
+        docs: list[dict[str, Any]] = []
+        resume = self.resume(pid, plan, seed + 1)
+        docs.append({"doc_id": f"{pid}-resume", "doc_type": "resume", "source_type": "PDF", "text": resume,
+                     "source": "synthetic", "seed": seed + 1})
+        cover = self.cover(pid, plan, seed + 2)
+        docs.append({"doc_id": f"{pid}-cover", "doc_type": "cover_letter", "source_type": "COVER_LETTER", "text": cover,
+                     "source": "synthetic", "seed": seed + 2})
+        if slot["job_family"] in ENGINEERING:
+            repo = self.repos[pid]
+            text, meta = self.repo_text(pid, repo)
+            docs.append({"doc_id": f"{pid}-repo", "doc_type": "repo", "source_type": "REPOSITORY", "text": text,
+                         "source": "github", "seed": None, "repo_url": f"https://github.com/{repo['full_name']}",
+                         "repo_commit": repo["commit"], "license": repo["license"], "repo_meta": meta})
+        ddir = self.corpus / "docs" / pid
+        ddir.mkdir(parents=True, exist_ok=True)
+        all_facts = []
+        for i, d in enumerate(docs):
+            (ddir / f"{d['doc_id']}.md").write_text(d["text"], encoding="utf-8")
+            all_facts += self.facts(d["doc_id"], d["doc_type"], d["text"], plan, seed + 10 + i)
+            a = self.analyze(d["doc_id"], d["source_type"], d["text"], seed + 20 + i)
+            d["analysis_attempts"] = a["attempts"]
+        meta = {
+            "persona_id": pid, "plan_meta": plan["_meta"], "n_experiences": len(plan["experiences"]),
+            "n_confusable_pairs": len(plan["confusable_pairs"]), "elapsed_sec": round(time.monotonic() - t0, 1),
+            "docs": [{k: v for k, v in d.items() if k != "text"} | {
+                "path": f"docs/{pid}/{d['doc_id']}.md", "chars": len(d["text"]),
+                "generator": GEN_MODEL if d["source"] == "synthetic" else f"github:{d['repo_url']}",
+                "analysis_path": f"analysis/{d['doc_id']}.md"} for d in docs],
+            "n_facts": len(all_facts),
+        }
+        (self.work(pid) / "persona_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+        return meta
+
+
+def check_evidence(text: str, ev: str) -> str:
+    if not ev or ev not in text:
+        return "원문에 그대로 없음"
+    if len(ev) < 15:
+        return "15자 미만"
+    if "\n" in ev:
+        return "줄바꿈 포함"
+    return ""
+
+
+BAND_RANGE = {"신입": (0, 0), "1~3": (1, 3), "4~7": (4, 7), "8+": (8, 40)}
+
+
+def validate_plan(plan: dict[str, Any], *, need_repo: bool, band: str) -> list[str]:
+    problems = []
+    lo, hi = BAND_RANGE[band]
+    if not lo <= plan["years_of_experience"] <= hi:
+        problems.append(f"years_of_experience {plan['years_of_experience']} 가 {band} 범위 밖")
+    ids = [e["experience_id"] for e in plan["experiences"]]
+    if len(set(ids)) != len(ids):
+        problems.append("experience_id 중복")
+    if not 4 <= len(ids) <= 7:
+        problems.append(f"경험 {len(ids)}개")
+    pairs = [cp for cp in plan["confusable_pairs"] if cp["a"] in ids and cp["b"] in ids and cp["a"] != cp["b"]]
+    if len(pairs) < 2:
+        problems.append(f"유효한 혼동 쌍 {len(pairs)}개")
+    if need_repo and plan["repo_experience_id"] not in ids:
+        problems.append("repo_experience_id 가 경험 목록에 없음")
+    return problems
+
+
+def load_slots() -> list[dict[str, str]]:
+    with (results_dir("E1-corpus") / "personas.csv").open(encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def main() -> None:
+    from servers.llama_server import base_url  # noqa: PLC0415
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--personas", default="")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--repos", default=str(results_dir("E1-corpus") / "repos.json"))
+    a = ap.parse_args()
+    slots = load_slots()
+    want = [s for s in slots if a.all or s["persona_id"] in a.personas.split(",")]
+    repos = json.loads(Path(a.repos).read_text(encoding="utf-8")) if Path(a.repos).exists() else {}
+    llm = LocalLLM(base_url(GEN_MODEL), model=GEN_MODEL, log_path=results_dir("E1-corpus") / "work" / "calls.jsonl")
+    gen = Generator(llm, repos=repos)
+    for s in want:
+        idx = int(s["persona_id"][1:])
+        print(f"== {s['persona_id']} {s['job_role']} {s['years_band']}", flush=True)
+        try:
+            m = gen.persona(s, idx)
+            print(f"   docs={len(m['docs'])} facts={m['n_facts']} pairs={m['n_confusable_pairs']} {m['elapsed_sec']}s", flush=True)
+        except (LocalLLMError, RuntimeError) as exc:
+            print(f"   FAIL {exc}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
