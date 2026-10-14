@@ -30,6 +30,7 @@ BASE_SEED = 7000
 GEN_MODEL = "M-M"  # gemma-4-26B-A4B-it UD-Q4_K_M (P-008)
 TEMP_CREATIVE = 0.8  # 설계·문서 (다양성)
 TEMP_EXTRACT = 0.1  # 사실 추출
+FACT_MAX_TOKENS = 4096  # 사실 추출 출력 상한 (반복 루프 차단, 정상 최대 966)
 ENGINEERING = {"backend", "frontend", "infra", "data", "mobile"}
 CAREER_BANDS = {"4~7", "8+"}  # 경력기술서 추가 (관리자 T03 답변 1)
 
@@ -425,8 +426,15 @@ class Generator:
         kept: list[dict[str, Any]] = []
         feedback = ""
         for attempt in range(3):
-            raw = self.llm.chat_json(fact_prompt(text, plan, doc_type, feedback), schema=FACT_SCHEMA,
-                                     seed=seed + 100 * attempt, temperature=TEMP_EXTRACT, tag=f"{doc_id}-facts")
+            # 상한은 반복 루프 차단용 (T03 P39: 30분·2.5만 토큰 생성 후 타임아웃). 정상 출력은 최대 966 토큰이라
+            # 상한 아래에서 끝나는 출력은 상한이 없을 때와 같다. 상한에 걸리면 다음 seed 로 넘어간다.
+            try:
+                raw = self.llm.chat_json(fact_prompt(text, plan, doc_type, feedback), schema=FACT_SCHEMA,
+                                         seed=seed + 100 * attempt, temperature=TEMP_EXTRACT, max_tokens=FACT_MAX_TOKENS,
+                                         tag=f"{doc_id}-facts")
+            except LocalLLMError as e:
+                print(f"  {doc_id} facts 시도 {attempt + 1}: {e}")
+                continue
             bad = []
             for f in raw["facts"]:
                 ev = f["evidence_text"]
