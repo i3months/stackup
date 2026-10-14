@@ -335,23 +335,33 @@ class Generator:
         domain = random.Random(seed).choice(DOMAINS)
         used = sorted({json.loads(q.read_text(encoding="utf-8"))["name"]
                        for q in (self.corpus / "work").glob("*/plan.json") if q.parent.name != slot["persona_id"]})
-        problems: list[str] = []
         timeline = career_timeline(slot["years_band"], seed)
-        for attempt in range(4):
-            msgs = plan_prompt(slot, domain, repo, readme, used, timeline)
-            if problems:
-                msgs[-1]["content"] += "\n\n이전 시도의 문제 (반드시 고칠 것): " + "; ".join(problems)
-            plan = self.llm.chat_json(msgs, schema=PLAN_SCHEMA,
-                                      seed=seed + 100 * attempt, temperature=TEMP_CREATIVE, tag=f"{slot['persona_id']}-plan")
-            problems = validate_plan(plan, need_repo=repo is not None, band=slot['years_band'], timeline=timeline)
-            if plan["name"] in used:
-                problems.append(f"이름 {plan['name']} 중복")
+        # 검증 실패가 4회 이어지면 seed 만 +50 바꿔 다시 4회 (최대 3개 seed, 관리자 T03 답변: P14).
+        # 프롬프트·도메인·타임라인은 그대로다. 시도 이력은 _meta.history 에 남긴다.
+        history: list[dict[str, Any]] = []
+        for rnd in range(3):
+            problems: list[str] = []
+            for attempt in range(4):
+                msgs = plan_prompt(slot, domain, repo, readme, used, timeline)
+                if problems:
+                    msgs[-1]["content"] += "\n\n이전 시도의 문제 (반드시 고칠 것): " + "; ".join(problems)
+                s = seed + 50 * rnd + 100 * attempt
+                plan = self.llm.chat_json(msgs, schema=PLAN_SCHEMA, seed=s, temperature=TEMP_CREATIVE,
+                                          tag=f"{slot['persona_id']}-plan")
+                problems = validate_plan(plan, need_repo=repo is not None, band=slot['years_band'], timeline=timeline)
+                if plan["name"] in used:
+                    problems.append(f"이름 {plan['name']} 중복")
+                history.append({"seed_round": rnd, "attempt": attempt + 1, "seed": s, "problems": problems})
+                if not problems:
+                    break
+                print(f"  plan 재시도 {rnd}-{attempt + 1}: {problems}")
             if not problems:
                 break
-            print(f"  plan 재시도 {attempt + 1}: {problems}")
+            print(f"  plan seed {seed + 50 * rnd} 4회 실패 → seed {seed + 50 * (rnd + 1)}")
         else:
             raise RuntimeError(f"{slot['persona_id']} 설계서 검증 실패: {problems}")
-        plan["_meta"] = {"domain": domain, "seed": seed + 100 * attempt, "generator": GEN_MODEL, "attempts": attempt + 1,
+        plan["_meta"] = {"domain": domain, "seed": s, "generator": GEN_MODEL, "attempts": len(history),
+                         "seed_round": rnd, "history": history,
                          "timeline": timeline, "generator_commit": stackup_commit()}
         p.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
         return plan
