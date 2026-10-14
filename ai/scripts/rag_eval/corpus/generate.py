@@ -375,13 +375,27 @@ class Generator:
         p.write_text(text, encoding="utf-8")
         return text
 
-    def career(self, pid: str, plan: dict[str, Any], seed: int) -> str:
-        p = self.work(pid) / "career.md"
+    def career(self, pid: str, plan: dict[str, Any], seed: int) -> tuple[str, int]:
+        """경력기술서와 실제 쓴 seed. 서버가 출력 형식 파싱 오류(HTTP 500)를 내면 seed 를 바꿔 재시도한다
+        (T03 P36: 'does not match the expected peg-gemma4 format'). 고정 seed 로는 같은 출력이 나온다."""
+        import urllib.error  # noqa: PLC0415
+
+        p, pm = self.work(pid) / "career.md", self.work(pid) / "career_meta.json"
         if p.exists():
-            return p.read_text(encoding="utf-8")
-        text = self.llm.chat(career_prompt(plan), seed=seed, temperature=TEMP_CREATIVE, tag=f"{pid}-career").strip() + "\n"
+            used = json.loads(pm.read_text(encoding="utf-8"))["seed"] if pm.exists() else seed
+            return p.read_text(encoding="utf-8"), used
+        for k in range(3):
+            try:
+                text = self.llm.chat(career_prompt(plan), seed=seed + 50 * k, temperature=TEMP_CREATIVE,
+                                     tag=f"{pid}-career").strip() + "\n"
+                break
+            except urllib.error.HTTPError as e:
+                if e.code != 500 or k == 2:
+                    raise
+                print(f"  career 서버 500, seed {seed + 50 * k} → {seed + 50 * (k + 1)} 로 재시도")
+        pm.write_text(json.dumps({"seed": seed + 50 * k, "server_500_retries": k}), encoding="utf-8")
         p.write_text(text, encoding="utf-8")
-        return text
+        return text, seed + 50 * k
 
     def cover(self, pid: str, plan: dict[str, Any], seed: int) -> str:
         p = self.work(pid) / "cover.json"
@@ -487,10 +501,10 @@ class Generator:
         docs.append({"doc_id": f"{pid}-cover", "doc_type": "cover_letter", "source_type": "COVER_LETTER", "text": cover,
                      "source": "synthetic", "seed": seed + 2})
         if slot["years_band"] in CAREER_BANDS:
-            career = self.career(pid, plan, seed + 3)
+            career, career_seed = self.career(pid, plan, seed + 3)
             # 경력기술서는 운영에서 이력서 PDF 슬롯으로 올라간다 (source_type PDF)
             docs.append({"doc_id": f"{pid}-career", "doc_type": "career_description", "source_type": "PDF",
-                         "text": career, "source": "synthetic", "seed": seed + 3})
+                         "text": career, "source": "synthetic", "seed": career_seed})
         if slot["job_family"] in ENGINEERING:
             repo = self.repos[pid]
             text, meta = self.repo_text(pid, repo)
