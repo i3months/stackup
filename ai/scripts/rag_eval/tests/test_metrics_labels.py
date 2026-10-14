@@ -56,8 +56,9 @@ def test_idcg_boundary_fewer_chunks_than_k():
     assert ndcg_at_k([0, 0], [0, 0, 2], 2) == 0.0
 
 
-def test_idcg_all_zero_is_undefined():
-    assert math.isnan(ndcg_at_k([0, 0], [0, 0, 0], 2))
+def test_idcg_all_zero_is_zero():
+    # SPEC v1.3 §6.1: 근거 도달 불가 (질의, 변형) 은 nDCG 0
+    assert ndcg_at_k([0, 0], [0, 0, 0], 2) == 0.0
 
 
 def test_hit_and_mrr():

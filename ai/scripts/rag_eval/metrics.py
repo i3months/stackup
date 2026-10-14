@@ -34,7 +34,9 @@ def dcg(grades: list[int]) -> float:
 def ndcg_at_k(ranked: list[int], all_grades: list[int], k: int) -> float:
     ideal = dcg(sorted(all_grades, reverse=True)[:k])
     if ideal == 0:
-        return float("nan")  # 관련 청크가 하나도 없는 (질의, 변형) — 평균에서 빠지고 개수 보고
+        # 정답 있는 질의인데 그 변형 어디에도 등급 ≥ 1 청크가 없다 (요약이 근거를 잃음 등). 그 변형의 실패로 보고 0
+        # (SPEC v1.3 §6.1, P-020). "근거 도달 불가"로 따로 세고, 뺀 민감도 수치도 낸다.
+        return 0.0
     return dcg(ranked[:k]) / ideal
 
 
@@ -71,7 +73,9 @@ def per_query(rankings: list[dict[str, Any]], queries: dict[str, dict[str, Any]]
         judged = sum(labels.judged(c, q["persona_id"]) for c in top)
         row: dict[str, Any] = {"query_id": r["query_id"], "persona_id": q["persona_id"], "qtype": q.get("qtype"),
                                "k": k, "n_scope_chunks": r["n_scope_chunks"], "judged_at_k": judged / max(len(top), 1),
-                               "no_answer": not q["gold_fact_ids"]}
+                               "no_answer": not q["gold_fact_ids"], "answer_quality": q.get("answer_quality"),
+                               "overlap_band_measured": q.get("overlap_band_measured"),
+                               "query_chars": len(q.get("query_text", ""))}
         if judged < len(top):
             row["error"] = "not_fully_judged"
             out.append(row)
@@ -85,7 +89,9 @@ def per_query(rankings: list[dict[str, Any]], queries: dict[str, dict[str, Any]]
         ranked = [labels.rel(c, gold) for c in top]
         all_g = [labels.rel(c, gold) for c in persona_chunks[q["persona_id"]]]
         row.update(grades=ranked, ndcg=ndcg_at_k(ranked, all_g, k), fact_recall=fact_recall_at_k(top, gold, labels),
-                   hit=hit_at_k(ranked, k), n_relevant_in_scope=sum(g > 0 for g in all_g))
+                   hit=hit_at_k(ranked, k), n_relevant_in_scope=sum(g > 0 for g in all_g),
+                   unreachable=not any(g > 0 for g in all_g),
+                   top1_score=r["results"][0]["score"] if r["results"] else None)
         if mrr_rankings is not None and r["query_id"] in mrr_rankings:
             m = mrr_rankings[r["query_id"]]
             row["mrr10"] = mrr_at_10([labels.rel(x["chunk_key"], gold) for x in m["results"]])
@@ -106,15 +112,28 @@ def summarize(rows: list[dict[str, Any]], k: int, mrr_source: str | None) -> dic
     out = {
         "k": k, "n_queries": len(rows), "n_answerable": len(ans),
         f"ndcg@{k}": mean("ndcg", ans), f"fact_recall@{k}": mean("fact_recall", ans), f"hit@{k}": mean("hit", ans),
-        "ndcg_undefined": sum(1 for r in ans if math.isnan(r.get("ndcg", 0.0))),
+        "unreachable": sum(1 for r in ans if r.get("unreachable")),
+        "unreachable_rate": round(sum(1 for r in ans if r.get("unreachable")) / max(len(ans), 1), 4),
+        f"ndcg@{k}_reachable_only": mean("ndcg", [r for r in ans if not r.get("unreachable")]),
         "judged@k": 1.0,
         "mrr@10": mean("mrr10", ans), "mrr_source_run": mrr_source,
         "no_answer": {"n": sum(r["no_answer"] for r in rows),
-                      "top1_scores": [r["top1_score"] for r in rows if r["no_answer"]]},
-        "by_qtype": {t: {f"ndcg@{k}": mean("ndcg", [r for r in ans if r["qtype"] == t]),
-                         "n": sum(1 for r in ans if r["qtype"] == t)}
-                     for t in sorted({r["qtype"] for r in ans if r["qtype"]})},
+                      "top1_scores": [r["top1_score"] for r in rows if r["no_answer"]],
+                      # 정답 있는 질의의 상위 1 점수와 겹치는지 같이 본다 (임계값 설계 근거)
+                      "answerable_top1_scores": [r["top1_score"] for r in ans if r.get("top1_score") is not None]},
     }
+
+    def breakdown(field: str) -> dict[str, Any]:
+        vals = sorted({str(r.get(field)) for r in ans})
+        return {v: {f"ndcg@{k}": mean("ndcg", [r for r in ans if str(r.get(field)) == v]),
+                    f"fact_recall@{k}": mean("fact_recall", [r for r in ans if str(r.get(field)) == v]),
+                    "n": sum(1 for r in ans if str(r.get(field)) == v),
+                    "unreachable": sum(1 for r in ans if str(r.get(field)) == v and r.get("unreachable"))}
+                for v in vals}
+
+    # 대역 분석은 실측 대역으로 (P-020): mid 는 비교에서 빼되 전체 지표에는 들어 있다. dontknow 는 None.
+    out.update(by_qtype=breakdown("qtype"), by_overlap_band_measured=breakdown("overlap_band_measured"),
+               by_answer_quality=breakdown("answer_quality"))
     if k == 10:
         out["excluded_small_scope"] = sum(1 for r in rows if not r["no_answer"] and r["n_scope_chunks"] < 20)
     return out
