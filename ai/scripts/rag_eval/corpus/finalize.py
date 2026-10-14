@@ -206,7 +206,10 @@ def generator_commit(pid: str) -> tuple[str, str]:
 
 def _evidence_ok(f: dict[str, Any]) -> bool:
     p = _corpus() / "docs" / f["persona_id"] / f"{f['doc_id']}.md"
-    t = p.read_text(encoding="utf-8")
+    # newline="" : 레포 원문의 CRLF 를 그대로 읽는다 (P29-repo requirements.txt). read_text 는 \r\n 을 \n 으로 바꿔
+    # 오프셋이 밀린다. 문서 파일은 운영 추출기 출력 그대로이고 오프셋은 그 원문 기준이다.
+    with p.open(encoding="utf-8", newline="") as fh:
+        t = fh.read()
     return t[f["char_start"]:f["char_end"]] == f["evidence_text"]
 
 
