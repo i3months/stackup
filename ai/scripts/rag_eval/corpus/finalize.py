@@ -205,7 +205,7 @@ def _evidence_ok(f: dict[str, Any]) -> bool:
 
 def review_sample(pids: list[str]) -> Path:
     corpus = _corpus()
-    out = ["# E1a 파일럿 검토 샘플 (T03)", "",
+    out = ["# E1a 검토 샘플 (T03)", "",
            "> 사람 현실성 점검용. 문서는 M-M(gemma-4-26B-A4B) 생성, 레포는 실제 공개 레포(운영 입력 구성).", ""]
     for pid in pids:
         w = corpus / "work" / pid
@@ -243,14 +243,15 @@ def main() -> None:
     ap.add_argument("--preserve", action="store_true")
     ap.add_argument("--batch", action="store_true")
     ap.add_argument("--review", action="store_true")
+    ap.add_argument("--review-personas", default="", help="검토 샘플 대상 (기본: 처리 대상 전부)")
     a = ap.parse_args()
-    done = {p.parent.name for p in (_corpus() / "work").glob("*/persona_meta.json")}
+    done = {p.parent.name for p in (_corpus() / "work").glob("P*/persona_meta.json")}  # _보관 폴더 제외
     pids = sorted(done) if a.all else [p for p in a.personas.split(",") if p in done]
     if a.preserve:
         print(json.dumps(run_preserve(pids, batch=a.batch), ensure_ascii=False))
     print(json.dumps(compile_outputs(pids), ensure_ascii=False, indent=1))
     if a.review:
-        print(review_sample(pids))
+        print(review_sample(a.review_personas.split(",") if a.review_personas else pids))
 
 
 if __name__ == "__main__":
