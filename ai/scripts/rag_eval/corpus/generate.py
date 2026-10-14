@@ -408,14 +408,22 @@ class Generator:
         p.write_text(text, encoding="utf-8")
         return text, seed + 50 * k
 
-    def cover(self, pid: str, plan: dict[str, Any], seed: int) -> str:
+    def doc_seed(self, pid: str, doc: str, seed: int) -> int:
+        """문서 재생성 seed. work/<pid>/doc_seed_rounds.json 의 {doc: r} 이면 seed + 50r (P-017: 프롬프트 유지,
+        seed 만 변경. T03 P39 자소서: 사실 추출이 9회 모두 반복 루프)."""
+        f = self.work(pid) / "doc_seed_rounds.json"
+        r = json.loads(f.read_text(encoding="utf-8")).get(doc, 0) if f.exists() else 0
+        return seed + 50 * r
+
+    def cover(self, pid: str, plan: dict[str, Any], seed: int) -> tuple[str, int]:
         p = self.work(pid) / "cover.json"
+        seed = self.doc_seed(pid, "cover", seed)
         if not p.exists():
             d = self.llm.chat_json(cover_prompt(plan), schema=COVER_SCHEMA, seed=seed, temperature=TEMP_CREATIVE,
                                    tag=f"{pid}-cover")
             p.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
         d = json.loads(p.read_text(encoding="utf-8"))
-        return build_cover_markdown(d["title"], d["items"])
+        return build_cover_markdown(d["title"], d["items"]), seed
 
     def facts(self, doc_id: str, doc_type: str, text: str, plan: dict[str, Any], seed: int) -> list[dict[str, Any]]:
         pid = doc_id.split("-")[0]
@@ -523,9 +531,9 @@ class Generator:
         resume = self.resume(pid, plan, seed + 1)
         docs.append({"doc_id": f"{pid}-resume", "doc_type": "resume", "source_type": "PDF", "text": resume,
                      "source": "synthetic", "seed": seed + 1})
-        cover = self.cover(pid, plan, seed + 2)
+        cover, cover_seed = self.cover(pid, plan, seed + 2)
         docs.append({"doc_id": f"{pid}-cover", "doc_type": "cover_letter", "source_type": "COVER_LETTER", "text": cover,
-                     "source": "synthetic", "seed": seed + 2})
+                     "source": "synthetic", "seed": cover_seed})
         if slot["years_band"] in CAREER_BANDS:
             career, career_seed = self.career(pid, plan, seed + 3)
             # 경력기술서는 운영에서 이력서 PDF 슬롯으로 올라간다 (source_type PDF)
