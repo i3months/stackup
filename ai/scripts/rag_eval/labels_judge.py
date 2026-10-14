@@ -1,0 +1,278 @@
+"""포함 판정 (T04, SPEC §4.3-1·3·4). LLM 판정 1회 = 텍스트 1개(청크 본문 또는 접두) + 그 페르소나 사실 전부.
+
+    python labels_judge.py chunks   --variants summary-c1000o200,raw-c1000o200 [--personas P03,P26] [--model haiku] [--batch]
+    python labels_judge.py prefixes [--personas ...] [--model haiku] [--batch]
+    python labels_judge.py auto     --variants raw-c1000o200,...      # 원문 변형 자동 full (LLM 판정 뒤에 덮어쓴다)
+    python labels_judge.py sample-kappa --personas P03,P26,P37 --n 180  # Haiku–Sonnet κ 묶음 (파일럿)
+
+- 같은 (페르소나, chunk_key) 는 변형이 달라도 한 번만 판정한다 (본문이 같으면 같은 판정).
+- 루브릭과 그 페르소나 사실 목록을 고정 앞부분(캐시)으로 두고 텍스트를 뒤에 붙인다. 구조화 출력, effort low.
+- 결과: E1-labels/containment.jsonl (labeler = 모델 ID 또는 auto), prefix_containment.jsonl.
+  주 판정자가 아닌 모델(κ 비교용 Sonnet)은 containment-<model>.jsonl 에 따로 둔다 (Labels 가 섞어 읽지 않게).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import random
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import results_dir, write_jsonl  # noqa: E402
+from labels import LABELS, auto_full, read_jsonl  # noqa: E402
+
+TASK_ID = "T04"
+BUDGET = 20.0
+MODELS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5"}
+PRIMARY = MODELS["haiku"]
+SCHEMA = {
+    "type": "object",
+    "properties": {"judgments": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"fact_id": {"type": "string"}, "label": {"type": "string", "enum": list(LABELS)}},
+        "required": ["fact_id", "label"], "additionalProperties": False}}},
+    "required": ["judgments"], "additionalProperties": False,
+}
+RUBRIC = (
+    "당신은 검색 평가 라벨러입니다. 한국어 지원자 문서에서 잘라 낸 텍스트 조각 하나와, 그 지원자에 관한 사실 목록이 "
+    "주어집니다. 사실마다 그 텍스트가 사실을 담고 있는지 판정하세요.\n"
+    "- full: 텍스트가 사실의 핵심 정보(수치·이름·도구·설정값·결과 등)를 담고 있다. 다른 말로 바꿔 쓴 것도 포함한다.\n"
+    "- partial: 같은 사실(같은 일·같은 대상)을 언급하지만 핵심 값이 빠졌다.\n"
+    "- none: 그 사실을 언급하지 않는다. 같은 도구나 비슷한 수치가 나와도 다른 경험·다른 일이면 none 이다.\n"
+    "텍스트에 있는 것만 보고 판정하세요. 텍스트 밖의 지식이나 다른 사실로 추론하지 마세요. "
+    "모든 fact_id 에 대해 정확히 한 번씩 답하세요."
+)
+
+
+def _labels_dir() -> Path:
+    return results_dir("E1-labels")
+
+
+def _now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def load_facts() -> dict[str, list[dict[str, Any]]]:
+    by: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for f in read_jsonl(results_dir("E1-corpus") / "facts.jsonl"):
+        by[f["persona_id"]].append(f)
+    return by
+
+
+def facts_block(facts: list[dict[str, Any]]) -> str:
+    return "[사실 목록]\n" + "\n".join(f"- {f['fact_id']}: {f['statement']}" for f in facts)
+
+
+def request(model: str, facts: list[dict[str, Any]], text: str, kind: str) -> dict[str, Any]:
+    from llm_client import cached_text  # noqa: PLC0415
+
+    return {
+        "model": model, "max_tokens": 4096, "output_config": {"effort": "low"},
+        "system": [cached_text(RUBRIC)],
+        "messages": [{"role": "user", "content": [
+            cached_text(facts_block(facts)),  # 페르소나마다 같은 앞부분
+            {"type": "text", "text": f"[{kind}]\n{text}"},
+        ]}],
+    }
+
+
+def _short(model: str) -> str:
+    return "h" if "haiku" in model else "s"
+
+
+def run_requests(items: list[dict[str, Any]], model: str, *, batch: bool, run_id: str) -> dict[str, Any]:
+    """items: {cid, persona_id, text, kind, fact_ids}. 반환: cid → {fact_id: label} (빠진 판정은 없음)."""
+    from llm_client import LabClient, json_of  # noqa: PLC0415
+
+    facts = load_facts()
+    lab = LabClient(task_id=TASK_ID, budget_usd=BUDGET, run_id=run_id)
+    reqs = [(it["cid"], request(model, [f for f in facts[it["persona_id"]] if f["fact_id"] in it["fact_ids"]],
+                                it["text"], it["kind"])) for it in items]
+    out: dict[str, dict[str, str]] = {}
+    per = 0.0004 if "haiku" in model else 0.008  # 보수적 추정 (Batch 할인 반영 전)
+    if batch:
+        for i in range(0, len(reqs), 5000):
+            part = reqs[i:i + 5000]
+            bid = lab.submit_batch(part, estimate_usd=per * len(part) * 0.5, json_schema=SCHEMA)
+            print(f"batch {bid} ({len(part)}건) 대기", flush=True)
+            lab.wait_batch(bid, poll_sec=30)
+            res = lab.collect_batch(bid)
+            for cid, _ in part:
+                if res.get(cid, {}).get("type") == "succeeded":
+                    out[cid] = {j["fact_id"]: j["label"] for j in json_of(res[cid]["message"])["judgments"]}
+    else:
+        for cid, r in reqs:
+            msg = lab.call(estimate_usd=per, json_schema=SCHEMA, **r)
+            out[cid] = {j["fact_id"]: j["label"] for j in json_of(msg)["judgments"]}
+    return {"labels": out, "spent_task_usd": round(lab.spent_usd(), 6)}
+
+
+# ---- 청크 판정 --------------------------------------------------------------------
+def chunk_items(variants: list[str], personas: set[str] | None, model: str, done: set[tuple[str, str]],
+                fact_ids_of: dict[str, list[str]]) -> list[dict[str, Any]]:
+    seen, items = set(), []
+    for c in read_jsonl(_labels_dir() / "chunks.jsonl"):
+        if c["variant_id"] not in variants or (personas and c["persona_id"] not in personas):
+            continue
+        key = (c["persona_id"], c["chunk_key"])
+        if key in seen:
+            continue
+        seen.add(key)
+        missing = [f for f in fact_ids_of[c["persona_id"]] if (c["chunk_key"], f) not in done]
+        if missing:
+            items.append({"cid": f"{_short(model)}-{c['persona_id']}-{c['chunk_key'][:48]}", "persona_id": c["persona_id"],
+                          "chunk_key": c["chunk_key"], "text": c["body"], "kind": "텍스트 조각", "fact_ids": missing})
+    return items
+
+
+def judge_chunks(variants: list[str], personas: set[str] | None, model: str, *, batch: bool,
+                 out_name: str = "containment.jsonl", items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    path = _labels_dir() / out_name
+    old = read_jsonl(path)
+    done = {(r["chunk_key"], r["fact_id"]) for r in old if r["labeler"] == model}
+    facts = load_facts()
+    fact_ids_of = {p: [f["fact_id"] for f in fs] for p, fs in facts.items()}
+    items = items if items is not None else chunk_items(variants, personas, model, done, fact_ids_of)
+    if not items:
+        return {"requests": 0}
+    res = run_requests(items, model, batch=batch, run_id=f"E1b-contain-{_short(model)}")
+    ts, rows, missing = _now(), [], 0
+    for it in items:
+        got = res["labels"].get(it["cid"])
+        if got is None:
+            missing += len(it["fact_ids"])
+            continue
+        for f in it["fact_ids"]:
+            if got.get(f) in LABELS:
+                rows.append({"chunk_key": it["chunk_key"], "fact_id": f, "label": got[f], "labeler": model,
+                             "persona_id": it["persona_id"], "ts": ts})
+            else:
+                missing += 1
+    write_jsonl(path, old + rows)
+    return {"requests": len(items), "pairs": len(rows), "missing_pairs": missing, "task_spent_usd": res["spent_task_usd"]}
+
+
+def auto_pass(variants: list[str]) -> dict[str, Any]:
+    """원문 변형 자동 full (SPEC §4.3-1). LLM 판정 뒤에 덮어쓰는 행으로 추가한다 (Labels 는 auto 를 LLM 보다 우선)."""
+    from index import load_corpus  # noqa: PLC0415  (newline="" 원문)
+
+    raw_docs = {d.doc_id: d.raw_text for d in load_corpus("E1")}
+    chunks = [c for c in read_jsonl(_labels_dir() / "chunks.jsonl") if c["variant_id"] in variants]
+    facts = read_jsonl(results_dir("E1-corpus") / "facts.jsonl")
+    path = _labels_dir() / "containment.jsonl"
+    old = read_jsonl(path)
+    have = {(r["chunk_key"], r["fact_id"]) for r in old if r["labeler"] == "auto"}
+    add = [r for r in auto_full(chunks, facts, raw_docs) if (r["chunk_key"], r["fact_id"]) not in have]
+    write_jsonl(path, old + add)
+    return {"auto_full_added": len(add)}
+
+
+# ---- 접두 판정 (SPEC §4.3-4) -------------------------------------------------------
+def judge_prefixes(personas: set[str] | None, model: str, *, batch: bool) -> dict[str, Any]:
+    """결정적 접두의 사실을 담는 부분은 문서 요약(≤200자)이라 문서마다 한 번 판정한다 (헤딩 경로는 청크마다 다르지만
+    사실을 담지 않는다). PFX-llm 접두는 청크마다 판정한다."""
+    facts = load_facts()
+    corpus = results_dir("E1-corpus")
+    path = _labels_dir() / "prefix_containment.jsonl"
+    old = read_jsonl(path)
+    done = {(r["prefix_id"], r["variant_id"], r["doc_id"], r["chunk_index"]) for r in old if r["labeler"] == model}
+    items = []
+    for a in sorted((corpus / "analysis").glob("P*.json")):
+        d = json.loads(a.read_text(encoding="utf-8"))
+        pid = d["doc_id"].split("-")[0]
+        if personas and pid not in personas or ("deterministic", "*", d["doc_id"], None) in done:
+            continue
+        items.append({"cid": f"{_short(model)}-pd-{d['doc_id']}", "persona_id": pid, "text": d["summary"],
+                      "kind": "문서 요약 접두", "fact_ids": [f["fact_id"] for f in facts[pid]],
+                      "key": ("deterministic", "*", d["doc_id"], None)})
+    for r in read_jsonl(_labels_dir() / "prefixes.jsonl"):
+        if r["prefix_id"] != "llm":
+            continue
+        pid = r["doc_id"].split("-")[0]
+        k = ("llm", r["variant_id"], r["doc_id"], r["chunk_index"])
+        if personas and pid not in personas or k in done:
+            continue
+        items.append({"cid": f"{_short(model)}-pl-{r['variant_id'][:20]}-{r['doc_id']}-{r['chunk_index']}",
+                      "persona_id": pid, "text": r["prefix_text"].strip(), "kind": "청크 맥락 접두",
+                      "fact_ids": [f["fact_id"] for f in facts[pid]], "key": k})
+    if not items:
+        return {"requests": 0}
+    res = run_requests(items, model, batch=batch, run_id=f"E1b-prefix-{_short(model)}")
+    ts, rows = _now(), []
+    for it in items:
+        got = res["labels"].get(it["cid"]) or {}
+        pfx, var, doc, ci = it["key"]
+        rows += [{"prefix_id": pfx, "variant_id": var, "doc_id": doc, "chunk_index": ci, "fact_id": f, "label": got[f],
+                  "labeler": model, "ts": ts} for f in it["fact_ids"] if got.get(f) in LABELS]
+    write_jsonl(path, old + rows)
+    return {"requests": len(items), "pairs": len(rows), "task_spent_usd": res["spent_task_usd"]}
+
+
+# ---- κ 표본 ----------------------------------------------------------------------
+def kappa_sample(personas: set[str], n: int, seed: int = 4041) -> list[dict[str, Any]]:
+    """주 판정자(Haiku) 라벨이 있는 (청크, 사실) 쌍에서 full/partial/none 을 고르게 층화해 뽑는다.
+    Sonnet 은 그 쌍이 든 청크를 통째로 판정한다 (같은 입력 형식) — 비교는 뽑힌 쌍만."""
+    rng = random.Random(seed)
+    rows = [r for r in read_jsonl(_labels_dir() / "containment.jsonl")
+            if r["labeler"] == PRIMARY and r.get("persona_id") in personas]
+    by = defaultdict(list)
+    for r in rows:
+        by[r["label"]].append(r)
+    pick = []
+    for lab in LABELS:
+        pick += rng.sample(by[lab], min(len(by[lab]), n // 3))
+    return pick
+
+
+def cohen_kappa(a: list[str], b: list[str]) -> float:
+    n = len(a)
+    po = sum(x == y for x, y in zip(a, b)) / n
+    ca, cb = Counter(a), Counter(b)
+    pe = sum(ca[k] * cb[k] for k in set(a) | set(b)) / (n * n)
+    return (po - pe) / (1 - pe) if pe < 1 else 1.0
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["chunks", "prefixes", "auto", "sample-kappa"])
+    ap.add_argument("--variants", default="")
+    ap.add_argument("--personas", default="")
+    ap.add_argument("--model", default="haiku", choices=list(MODELS))
+    ap.add_argument("--batch", action="store_true")
+    ap.add_argument("--n", type=int, default=180)
+    a = ap.parse_args()
+    variants = [v for v in a.variants.split(",") if v]
+    personas = set(a.personas.split(",")) if a.personas else None
+    model = MODELS[a.model]
+    if a.cmd == "chunks":
+        print(json.dumps(judge_chunks(variants, personas, model, batch=a.batch), ensure_ascii=False))
+    elif a.cmd == "prefixes":
+        print(json.dumps(judge_prefixes(personas, model, batch=a.batch), ensure_ascii=False))
+    elif a.cmd == "auto":
+        print(json.dumps(auto_pass(variants), ensure_ascii=False))
+    else:
+        pick = kappa_sample(personas or set(), a.n)
+        chunks = {c["chunk_key"]: c for c in read_jsonl(_labels_dir() / "chunks.jsonl")}
+        need = defaultdict(set)
+        for r in pick:
+            need[(r["persona_id"], r["chunk_key"])].add(r["fact_id"])
+        items = [{"cid": f"s-{pid}-{ck[:48]}", "persona_id": pid, "chunk_key": ck, "text": chunks[ck]["body"],
+                  "kind": "텍스트 조각", "fact_ids": [f["fact_id"] for f in load_facts()[pid]]} for (pid, ck) in need]
+        res = judge_chunks([], None, MODELS["sonnet"], batch=a.batch, out_name="containment-sonnet-pilot.jsonl",
+                           items=items)
+        write_jsonl(_labels_dir() / "kappa-sample.jsonl", pick)
+        son = {(r["chunk_key"], r["fact_id"]): r["label"]
+               for r in read_jsonl(_labels_dir() / "containment-sonnet-pilot.jsonl")}
+        pairs = [(r["label"], son[(r["chunk_key"], r["fact_id"])]) for r in pick if (r["chunk_key"], r["fact_id"]) in son]
+        k = cohen_kappa([x for x, _ in pairs], [y for _, y in pairs]) if pairs else None
+        print(json.dumps(res | {"pairs_compared": len(pairs), "kappa_haiku_sonnet": k,
+                                "confusion": Counter(f"{x}->{y}" for x, y in pairs)}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

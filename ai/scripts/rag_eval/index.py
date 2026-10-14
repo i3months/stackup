@@ -317,16 +317,19 @@ def load_to_db(cond: C.Condition, rows: list[dict[str, Any]], texts: list[str], 
 
 
 # ---- 진입점 -------------------------------------------------------------------
-def merge_jsonl(path: Path, rows: list[dict[str, Any]], key: str, value: str) -> None:
+def merge_jsonl(path: Path, rows: list[dict[str, Any]], key: str | tuple[str, ...], value: str | tuple[str, ...]) -> None:
+    """key 값이 value 인 기존 행을 rows 로 바꾼다 (여러 필드면 튜플)."""
+    keys = key if isinstance(key, tuple) else (key,)
+    vals = value if isinstance(value, tuple) else (value,)
     keep = []
     if path.exists():
         keep = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
-        keep = [r for r in keep if r.get(key) != value]
+        keep = [r for r in keep if tuple(r.get(k) for k in keys) != vals]
     write_jsonl(path, keep + rows)
 
 
-def index(cond: C.Condition, corpus: str, out: str, dsn: str = PG_DSN_DEFAULT) -> dict[str, Any]:
-    t0 = time.perf_counter()
+def chunks_and_prefixes(cond: C.Condition, corpus: str, out: str) -> tuple[list[dict[str, Any]], dict[tuple, str], str | None]:
+    """변형 청크와 접두를 만들고 chunks.jsonl·prefixes.jsonl (SPEC §9.2) 에 쓴다. 임베딩 없음."""
     docs = load_corpus(corpus)
     by_id = {d.doc_id: d for d in docs}
     rows = variant_chunks(cond, docs)
@@ -339,14 +342,20 @@ def index(cond: C.Condition, corpus: str, out: str, dsn: str = PG_DSN_DEFAULT) -
     else:
         prefixes = {(r["doc_id"], r["chunk_index"]): "" for r in rows}
         gen = None
-    texts = [prefixes[(r["doc_id"], r["chunk_index"])] + r["body"] for r in rows]
     outdir = results_dir(out)
     merge_jsonl(outdir / "chunks.jsonl", rows, "variant_id", cond.variant_id)
     if cond.prefix != "none":
         pref_rows = [{"variant_id": r["variant_id"], "doc_id": r["doc_id"], "chunk_index": r["chunk_index"],
                       "prefix_id": cond.prefix, "prefix_text": prefixes[(r["doc_id"], r["chunk_index"])],
                       "generator": gen} for r in rows]
-        merge_jsonl(outdir / f"prefixes-{cond.prefix}.jsonl", pref_rows, "variant_id", cond.variant_id)
+        merge_jsonl(outdir / "prefixes.jsonl", pref_rows, ("variant_id", "prefix_id"), (cond.variant_id, cond.prefix))
+    return rows, prefixes, gen
+
+
+def index(cond: C.Condition, corpus: str, out: str, dsn: str = PG_DSN_DEFAULT) -> dict[str, Any]:
+    t0 = time.perf_counter()
+    rows, prefixes, _ = chunks_and_prefixes(cond, corpus, out)
+    texts = [prefixes[(r["doc_id"], r["chunk_index"])] + r["body"] for r in rows]
     t1 = time.perf_counter()
     emb = Embedder(cond)
     vecs = emb.encode(texts, query=False)
@@ -364,9 +373,15 @@ def main() -> None:
     ap.add_argument("--condition", required=True, help="조건 ID 또는 쉼표 목록")
     ap.add_argument("--out", default="E1-labels")
     ap.add_argument("--dsn", default=PG_DSN_DEFAULT)
+    ap.add_argument("--chunks-only", action="store_true", help="청크·접두만 쓰고 임베딩·적재는 하지 않는다 (T04 라벨링)")
     a = ap.parse_args()
     for cid in a.condition.split(","):
-        print(json.dumps(index(C.load(cid), a.corpus, a.out, a.dsn), ensure_ascii=False))
+        if a.chunks_only:
+            rows, _, gen = chunks_and_prefixes(C.load(cid), a.corpus, a.out)
+            print(json.dumps({"condition": cid, "variant_id": C.load(cid).variant_id, "n_chunks": len(rows),
+                              "prefix": gen}, ensure_ascii=False))
+        else:
+            print(json.dumps(index(C.load(cid), a.corpus, a.out, a.dsn), ensure_ascii=False))
 
 
 if __name__ == "__main__":

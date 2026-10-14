@@ -172,3 +172,16 @@ def test_k10_excludes_small_scope():
                      queries, lab, {"P": ["c1", "c2", "c3", "c4", "c5"]})
     s = summarize(rows, 10, None)
     assert s["n_answerable"] == 0 and s["excluded_small_scope"] == 1
+
+
+def test_labeler_priority_human_over_auto_over_llm():
+    def r(label, labeler):
+        return {"chunk_key": "c", "fact_id": "F1", "label": label, "labeler": labeler, "ts": ""}
+
+    # 원문 변형: LLM 이 none 이라고 해도 자동 full 이 덮어쓴다 (행 순서와 무관)
+    assert Labels([r("full", "auto"), r("none", "claude-haiku-5-5")], FACTS).label[("c", "F1")] == "full"
+    assert Labels([r("none", "claude-haiku-5-5"), r("full", "auto")], FACTS).label[("c", "F1")] == "full"
+    # 사람 판정이 가장 우선
+    assert Labels([r("full", "auto"), r("partial", "human:a")], FACTS).label[("c", "F1")] == "partial"
+    # 같은 등급이면 나중 행
+    assert Labels([r("none", "m"), r("partial", "m")], FACTS).label[("c", "F1")] == "partial"

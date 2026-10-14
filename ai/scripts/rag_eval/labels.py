@@ -31,15 +31,26 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
 
 
+def labeler_rank(labeler: str) -> int:
+    """같은 쌍에 판정이 여럿이면 사람 > auto(원문 자동 full) > LLM. 같은 등급이면 나중 행."""
+    if labeler.startswith("human:"):
+        return 3
+    return 2 if labeler == "auto" else 1
+
+
 class Labels:
-    """containment 조회: (chunk_key, fact_id) → label. 같은 쌍이 여러 번 있으면 마지막(사람 > LLM > auto 순으로 덧씀)."""
+    """containment 조회: (chunk_key, fact_id) → label. 판정이 여럿이면 labeler_rank 가 높은 것 (T04: 원문 변형은
+    LLM 이 전 청크를 판정하고 자동 full 이 덮어쓴다)."""
 
     def __init__(self, containment: Iterable[dict[str, Any]], facts: Iterable[dict[str, Any]]) -> None:
         self.label: dict[tuple[str, str], str] = {}
+        rank: dict[tuple[str, str], int] = {}
         for r in containment:
             if r["label"] not in LABELS:
                 raise ValueError(f"알 수 없는 라벨 {r['label']}")
-            self.label[(r["chunk_key"], r["fact_id"])] = r["label"]
+            k, rk = (r["chunk_key"], r["fact_id"]), labeler_rank(r["labeler"])
+            if rk >= rank.get(k, 0):
+                self.label[k], rank[k] = r["label"], rk
         self.facts = {f["fact_id"]: f for f in facts}
         self.persona_facts: dict[str, list[str]] = defaultdict(list)
         for f in self.facts.values():
@@ -125,7 +136,9 @@ def main() -> None:
     chunks = [c for c in read_jsonl(d / "chunks.jsonl") if c["variant_id"] == a.variant]
     facts = read_jsonl(results_dir("E1-corpus") / "facts.jsonl")
     if a.cmd == "auto":
-        raw_docs = {p.stem: p.read_text(encoding="utf-8") for p in (results_dir("E1-corpus") / "docs").glob("*/*.md")}
+        from index import load_corpus  # noqa: PLC0415  (newline="" — 레포 원문 CRLF 보존)
+
+        raw_docs = {d.doc_id: d.raw_text for d in load_corpus("E1")}
         new = auto_full(chunks, facts, raw_docs)
         old = read_jsonl(d / "containment.jsonl")
         have = {(r["chunk_key"], r["fact_id"]) for r in old}
