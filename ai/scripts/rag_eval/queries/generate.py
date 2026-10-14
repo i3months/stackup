@@ -9,8 +9,10 @@
 - query_text 는 운영 질의 구성 그대로다.
   followup = 직전 질문 + "\\n\\n" + 답변 (followup_consumer), coaching = 질문 + "\\n" + 답변 (feedback_consumer),
   pool = 운영 questions_consumer._build_initial_rag_query(GenerateQuestionsRequest) 를 직접 호출.
-- 어휘 겹침: 사실을 담은 텍스트(답변, dontknow 는 직전 질문, pool 은 자기소개)와 근거 구간 합집합의 Kiwi 형태소
-  자카드. 지정 대역과 실측이 어긋나면 seed 만 +50 바꿔 다시 만든다 (P-017, 최대 3개 seed).
+- 어휘 겹침: 사실을 담은 텍스트(답변, dontknow 는 직전 질문, pool 은 자기소개)와 근거 구간 합집합의 Kiwi 형태소.
+  overlap_coverage(근거 포괄률)로 대역을 판정하고 overlap_jaccard 도 저장한다 (P-020). 지정 대역(overlap_band)과 실측
+  (overlap_band_measured: high ≥ 0.7, low ≤ 0.5, 그 사이 mid)이 어긋나면 seed 만 +50 바꿔 다시 만든다 (P-017, 최대 3개
+  seed). 그래도 어긋나면 버리지 않고 실측 대역으로 분석한다.
 - 결과: stackup-lab/results/E1-queries/queries.jsonl, 작업 파일 work/<pid>.jsonl (페르소나 단위 재실행).
 """
 
@@ -36,8 +38,10 @@ TEMP = 0.8
 N_PER_PERSONA = {"followup": 9, "coaching": 4, "pool": 2}
 NO_ANSWER_TOTAL = 52  # followup·coaching 520개의 10%
 # 겹침 대역 경계 (Kiwi 형태소 자카드). dev 파일럿 분포로 정한다 (T04 지시: 조정은 dev 에서만).
-HIGH_MIN = 0.30  # dev 파일럿 P03 v0 실측: low 지정 답변 0.04~0.23, high 지정 0.32~0.88
-LOW_MAX = 0.20
+# 대역은 근거 포괄률(근거 토큰 중 사실을 담은 텍스트에 나온 비율)로 판정한다 (P-020). 자카드는 답변 길이·코드 근거에
+# 흔들려 dev 파일럿에서 seed 3개 후에도 28% 가 대역 밖이었다. 경계는 dev 파일럿에서 정했고 test 를 보고 바꾸지 않는다.
+HIGH_MIN = 0.70
+LOW_MAX = 0.50
 MAX_ROUNDS = 3
 ROLE_KO = {
     "BACKEND": "백엔드 개발자", "FRONTEND": "프론트엔드 개발자", "DEVOPS": "인프라/DevOps 엔지니어",
@@ -237,8 +241,8 @@ def jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b) if a | b else 0.0
 
 
-def band_of(j: float) -> str | None:
-    return "high" if j >= HIGH_MIN else ("low" if j <= LOW_MAX else None)
+def band_of(coverage: float) -> str:
+    return "high" if coverage >= HIGH_MIN else ("low" if coverage <= LOW_MAX else "mid")
 
 
 def no_answer_check(text: str, p: dict[str, Any]) -> dict[str, Any]:
@@ -279,8 +283,9 @@ class QueryGen:
                 rec["no_answer_check"] = chk
                 if not chk["ok"]:
                     problems.append(f"정답 없음 답변이 페르소나 사실과 겹침 {chk}")
-            elif s["overlap_band"] and band_of(rec["overlap_jaccard"]) != s["overlap_band"]:
-                problems.append(f"겹침 {rec['overlap_jaccard']:.3f} 이 {s['overlap_band']} 대역 밖")
+            elif s["overlap_band"] and rec["overlap_band_measured"] != s["overlap_band"]:
+                problems.append(f"포괄률 {rec['overlap_coverage']:.3f} ({rec['overlap_band_measured']}) 이 "
+                                f"{s['overlap_band']} 대역 밖")
             history.append({"seed": seed, "problems": problems})
             if not problems:
                 break
@@ -320,7 +325,8 @@ class QueryGen:
         j = jaccard(tokens(fact_text), ev) if ev else None
         cov = len(tokens(fact_text) & ev) / len(ev) if ev else None
         base.update(overlap_jaccard=None if j is None else round(j, 4),
-                    evidence_coverage=None if cov is None else round(cov, 4), fact_text=fact_text)
+                    overlap_coverage=None if cov is None else round(cov, 4),
+                    overlap_band_measured=None if cov is None else band_of(cov), fact_text=fact_text)
         return base
 
 
@@ -361,7 +367,8 @@ def main() -> None:
         write_json(_out() / "manifest.json", {
             "created_at": now_iso(), "script": "ai/scripts/rag_eval/queries/generate.py", "stackup_commit": stackup_commit(),
             "generator": GEN_MODEL, "cache_prompt": False, "temperature": TEMP, "seed_rule": "90000 + 번호×10000 + 질의×100, 라운드 +50",
-            "bands": {"high_min": HIGH_MIN, "low_max": LOW_MAX}, "n": len(rows),
+            "bands": {"measure": "overlap_coverage", "high_min": HIGH_MIN, "low_max": LOW_MAX,
+                      "mid": "0.5 < coverage < 0.7"}, "n": len(rows),
             "by_qtype": dict(Counter(r["qtype"] for r in rows)), "no_answer": sum(r["no_answer"] for r in rows)})
 
 

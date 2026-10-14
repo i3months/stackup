@@ -165,7 +165,7 @@ def judge_chunks(variants: list[str], personas: set[str] | None, model: str, *, 
         for f in it["fact_ids"]:
             if got.get(f) in LABELS:
                 rows.append({"chunk_key": it["chunk_key"], "fact_id": f, "label": got[f], "labeler": model,
-                             "persona_id": it["persona_id"], "prompt_version": rubric, "ts": ts})
+                             "persona_id": it["persona_id"], "rubric_version": rubric, "ts": ts})
             else:
                 missing += 1
     write_jsonl(path, old + rows)
@@ -223,7 +223,7 @@ def judge_prefixes(personas: set[str] | None, model: str, *, batch: bool) -> dic
         got = res["labels"].get(it["cid"]) or {}
         pfx, var, doc, ci = it["key"]
         rows += [{"prefix_id": pfx, "variant_id": var, "doc_id": doc, "chunk_index": ci, "fact_id": f, "label": got[f],
-                  "labeler": model, "prompt_version": "v2", "ts": ts} for f in it["fact_ids"] if got.get(f) in LABELS]
+                  "labeler": model, "rubric_version": "v2", "ts": ts} for f in it["fact_ids"] if got.get(f) in LABELS]
     write_jsonl(path, old + rows)
     return {"requests": len(items), "pairs": len(rows), "task_spent_usd": res["spent_task_usd"]}
 
