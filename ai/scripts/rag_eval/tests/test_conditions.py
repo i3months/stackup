@@ -16,18 +16,22 @@ MODEL_BOUND = {"query_instruction", "dtype", "truncate_dim"}
 META = {"condition_id", "description", "exploratory"}
 
 
-def test_nineteen_conditions():
+RAW_CHUNKING = {"R-SRCraw-CH-500", "R-SRCraw-CH-1500", "R-SRCraw-CH-head"}  # P-019 원문 위 청킹 탐색
+
+
+def test_condition_set():
     allc = C.load_all()
-    assert len(allc) == 19
+    assert len(allc) == 22
     assert sum(not c.exploratory for c in allc.values()) == 17
-    assert {"R-EMB-4m", "R-EMB-1-bf16"} == {k for k, c in allc.items() if c.exploratory}
+    assert {"R-EMB-4m", "R-EMB-1-bf16"} | RAW_CHUNKING == {k for k, c in allc.items() if c.exploratory}
 
 
 def test_one_factor_at_a_time():
     allc = C.load_all()
-    b0 = asdict(allc["B0"])
     for cid, c in allc.items():
-        diff = {k for k, v in asdict(c).items() if b0[k] != v} - META
+        # 원문 청킹 탐색 조건은 R-SRC-raw 를 기준으로 한 요인만 바꾼다
+        base = asdict(allc["R-SRC-raw" if cid in RAW_CHUNKING else "B0"])
+        diff = {k for k, v in asdict(c).items() if base[k] != v} - META
         if cid == "B0":
             assert not diff
             continue
@@ -38,6 +42,8 @@ def test_one_factor_at_a_time():
         assert len(factors) <= 1, (cid, diff)
         if cid == "R-EMB-1-bf16":
             assert diff == {"dtype"}
+        if cid in RAW_CHUNKING:
+            assert factors == {"chunking"}, (cid, diff)
 
 
 def test_query_instruction_policy():
@@ -53,6 +59,7 @@ def test_variant_and_index_keys():
     allc = C.load_all()
     assert allc["B0"].variant_id == "summary-c1000o200"
     assert allc["R-CH-head"].variant_id == "summary-h2000o0"
+    assert {allc[c].variant_id for c in RAW_CHUNKING} == {"raw-c500o100", "raw-c1500o300", "raw-h2000o0"}
     assert allc["R-RR-1"].index_key == allc["B0"].index_key  # 재순위는 인덱스 재사용
     assert allc["R-EMB-4m"].index_key != allc["R-EMB-4"].index_key
     assert allc["B0"].cand_for(5) == 5 and allc["R-CAND-4x"].cand_for(5) == 20
