@@ -425,15 +425,22 @@ class Generator:
         valid_ids = {e["experience_id"] for e in plan["experiences"]} | {"NONE"}
         kept: list[dict[str, Any]] = []
         feedback = ""
-        for attempt in range(3):
+        capped = False
+        for i in range(9):
             # 상한은 반복 루프 차단용 (T03 P39: 30분·2.5만 토큰 생성 후 타임아웃). 정상 출력은 최대 966 토큰이라
             # 상한 아래에서 끝나는 출력은 상한이 없을 때와 같다. 상한에 걸리면 다음 seed 로 넘어간다.
+            # 기본 3회. 상한에 걸린 적이 있고 사실이 6개 미만이면 seed +50 라운드를 최대 2번 더 (설계서와 같은 규칙,
+            # P39 자소서: 3회 모두 근거 문장을 끝없이 이어 붙임).
+            rnd, attempt = divmod(i, 3)
+            if rnd and not capped:
+                break
             try:
                 raw = self.llm.chat_json(fact_prompt(text, plan, doc_type, feedback), schema=FACT_SCHEMA,
-                                         seed=seed + 100 * attempt, temperature=TEMP_EXTRACT, max_tokens=FACT_MAX_TOKENS,
-                                         tag=f"{doc_id}-facts")
+                                         seed=seed + 50 * rnd + 100 * attempt, temperature=TEMP_EXTRACT,
+                                         max_tokens=FACT_MAX_TOKENS, tag=f"{doc_id}-facts")
             except LocalLLMError as e:
-                print(f"  {doc_id} facts 시도 {attempt + 1}: {e}")
+                capped = True
+                print(f"  {doc_id} facts 시도 {rnd}-{attempt + 1}: {e}")
                 continue
             bad = []
             for f in raw["facts"]:
@@ -446,7 +453,7 @@ class Generator:
                 if reason:
                     bad.append(f"- '{ev[:60]}': {reason}")
                     continue
-                kept.append({**f, "attempt": attempt + 1})
+                kept.append({**f, "attempt": i + 1})
             if len(kept) >= 6:
                 break
             feedback = (f"유효한 사실이 {len(kept)}개뿐입니다. 다음은 버려졌습니다:\n" + "\n".join(bad[:10])
@@ -488,9 +495,10 @@ class Generator:
         messages = [{"role": role[m.type], "content": m.content} for m in msgs]
         errors = []
         for attempt in range(s.document_analysis_max_attempts):  # 운영 with_retry 와 같은 3회
-            raw = self.llm.chat(messages, seed=seed + 100 * attempt, temperature=s.llm_pro_temperature,
-                                tag=f"{doc_id}-analysis")
+            # 운영 with_retry 는 모든 예외를 잡으므로 서버 오류(500)도 한 번의 실패 시도로 센다 (T03 P39).
             try:
+                raw = self.llm.chat(messages, seed=seed + 100 * attempt, temperature=s.llm_pro_temperature,
+                                    tag=f"{doc_id}-analysis")
                 res = parser.parse(raw)
                 break
             except Exception as exc:  # noqa: BLE001
