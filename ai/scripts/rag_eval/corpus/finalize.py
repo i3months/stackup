@@ -187,10 +187,17 @@ def compile_outputs(pids: list[str]) -> dict[str, Any]:
     return stats
 
 
-# 생성 도중 생성기 코드가 바뀌었다 (관리자 T03 답변). a11ea76 부터는 plan._meta 에 커밋을 남긴다.
-# 그 전 페르소나는 plan._meta 로 추정한다: timeline 이 있으면 0205187 (전체 실행 재시작 04:15 이후),
-# 없으면 aef8507 (P01, 04:15 이전 첫 실행). 두 실행 모두 작업 트리가 깨끗한 상태에서 시작했다.
+# 생성 도중 생성기 코드가 바뀌었다 (관리자 T03 답변). 우선순위:
+# 1. generation-runs.json (corpus/generation_runs.py): 실행 로그 구간별 프로세스 시작 시점 커밋 중 현재 산출물 파일을
+#    만든 실행들. plan._meta.generator_commit 은 계획 저장 시점의 HEAD 라 실행 중 커밋이 섞인다 (예: P37 → 347c1ee 로
+#    찍혔지만 실제 코드는 ce8a51b).
+# 2. plan._meta.generator_commit (recorded) 3. plan._meta 의 timeline 유무로 추정 (inferred).
 def generator_commit(pid: str) -> tuple[str, str]:
+    runs = _corpus() / "generation-runs.json"
+    if runs.exists():
+        art = json.loads(runs.read_text(encoding="utf-8")).get("personas_artifacts", {})
+        if art.get(pid):
+            return "+".join(art[pid]), "run_log"
     m = json.loads((_corpus() / "work" / pid / "plan.json").read_text(encoding="utf-8")).get("_meta", {})
     if m.get("generator_commit"):
         return m["generator_commit"], "recorded"
