@@ -3,6 +3,8 @@
 - 생각 모드는 서버 기본값으로 꺼져 있다 (servers/llama_server.py). 응답마다 reasoning_content 가
   비었는지 단언한다 (SPEC §5.2, P-013).
 - 호출마다 시드·토큰·지연을 calls.jsonl 에 남긴다 (생성 주체·시드 기록, SPEC §9.2 generator).
+- cache_prompt 기본값은 False (P-018). llama-server 는 프롬프트 캐시 재사용 여부에 따라 같은 seed 로도
+  출력이 갈린다 (results/E1-corpus/determinism-*.json). None 이면 서버 기본값(켜짐)을 쓴다 — E1a 코퍼스 생성 조건.
 """
 
 from __future__ import annotations
@@ -19,12 +21,14 @@ class LocalLLMError(RuntimeError):
 
 
 class LocalLLM:
-    def __init__(self, base_url: str, *, model: str, log_path: Path, timeout: float = 1800) -> None:
+    def __init__(self, base_url: str, *, model: str, log_path: Path, timeout: float = 1800,
+                 cache_prompt: bool | None = False) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
+        self.cache_prompt = cache_prompt
 
     def chat(
         self,
@@ -39,6 +43,8 @@ class LocalLLM:
         body: dict[str, Any] = {"messages": messages, "seed": seed, "temperature": temperature}
         if max_tokens:
             body["max_tokens"] = max_tokens
+        if self.cache_prompt is not None:
+            body["cache_prompt"] = self.cache_prompt
         if json_schema is not None:
             body["response_format"] = {"type": "json_schema", "json_schema": {"name": "out", "schema": json_schema}}
         req = urllib.request.Request(
@@ -54,7 +60,7 @@ class LocalLLM:
         rc = msg.get("reasoning_content")
         rec = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "tag": tag, "model": self.model, "seed": seed,
-            "temperature": temperature, "max_tokens": max_tokens, "json_schema": json_schema is not None,
+            "temperature": temperature, "max_tokens": max_tokens, "cache_prompt": self.cache_prompt, "json_schema": json_schema is not None,
             "finish_reason": choice.get("finish_reason"), "usage": d.get("usage"),
             "latency_sec": round(latency, 2), "reasoning_chars": len(rc or ""),
         }

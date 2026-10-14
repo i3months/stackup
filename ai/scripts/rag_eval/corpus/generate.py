@@ -692,7 +692,9 @@ def main() -> None:
     slots = load_slots()
     want = [s for s in slots if a.all or s["persona_id"] in a.personas.split(",")]
     repos = json.loads(Path(a.repos).read_text(encoding="utf-8")) if Path(a.repos).exists() else {}
-    llm = LocalLLM(base_url(GEN_MODEL), model=GEN_MODEL, log_path=results_dir("E1-corpus") / "work" / "calls.jsonl")
+    # E1a 코퍼스는 서버 기본값(프롬프트 캐시 켜짐)으로 만들었다. 재현 단위 = 같은 순서의 전체 실행 (P-018)
+    llm = LocalLLM(base_url(GEN_MODEL), model=GEN_MODEL, log_path=results_dir("E1-corpus") / "work" / "calls.jsonl",
+                   cache_prompt=None)
     gen = Generator(llm, repos=repos)
     for s in want:
         free = windows_free_gb()
