@@ -48,6 +48,13 @@ class Doc:
     summary: str
 
 
+def _read_raw(p: Path) -> str:
+    """문서 원문을 바이트 그대로 읽는다. read_text 는 CRLF 를 LF 로 바꾸는데, 레포 원문(운영 추출기 출력)에는
+    CRLF 파일이 있다 (E1a P29-repo). 사실 오프셋도 이 원문 기준이다 (T03 보고서 §5-5)."""
+    with p.open(encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
 def load_corpus(name: str) -> list[Doc]:
     if name == "cases":
         return _cases_corpus()
@@ -60,7 +67,7 @@ def load_corpus(name: str) -> list[Doc]:
             continue
         a = json.loads(js.read_text(encoding="utf-8"))
         docs.append(Doc(persona_id=p.parent.name, doc_id=doc_id, doc_type=doc_id.split("-", 1)[1],
-                        raw_text=p.read_text(encoding="utf-8"),
+                        raw_text=_read_raw(p),
                         analysis_md=(corpus / "analysis" / f"{doc_id}.md").read_text(encoding="utf-8"),
                         summary=a["summary"]))
     return docs
