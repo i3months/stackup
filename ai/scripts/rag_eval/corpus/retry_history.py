@@ -19,6 +19,7 @@ for ln in open(LOG, encoding="utf-8", errors="replace"):
     if "facts 시도" in ln: ev[cur]["facts_cap"] += 1
     if "career 서버 500" in ln: ev[cur]["career_500"] += 1
 
+RUNS = json.load(open(f"{LAB}/generation-runs.json", encoding="utf-8"))["personas_artifacts"]
 rows = []
 for w in sorted(glob.glob(f"{LAB}/work/P*/plan.json")):
     pid = w.split("/")[-2]
@@ -39,7 +40,7 @@ for w in sorted(glob.glob(f"{LAB}/work/P*/plan.json")):
     dsr = f"{LAB}/work/{pid}/doc_seed_rounds.json"
     rows.append({
         "pid": pid, "plan_attempts": m.get("attempts"), "seed_round": m.get("seed_round", 0),
-        "commit": m.get("generator_commit") or ("0205187*" if "timeline" in m else "aef8507*"),
+        "commit": "+".join(RUNS.get(pid, [])),  # 산출물을 만든 실행의 코드 커밋 (generation_runs.py)
         "failed_runs": ev[pid]["plan_fail_runs"], "plan_retries_logged": ev[pid]["plan_retry_log"],
         "facts_cap_hits": ev[pid]["facts_cap"], "facts_late_attempts": ",".join(sorted(facts_att)),
         "analysis_retries": ",".join(sorted(ana)), "career_500": c500 + ev[pid]["career_500"],
