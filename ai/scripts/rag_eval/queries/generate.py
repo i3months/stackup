@@ -31,13 +31,13 @@ from common import now_iso, results_dir, stackup_commit, write_json  # noqa: E40
 from local_llm import LocalLLM, LocalLLMError  # noqa: E402
 
 GEN_MODEL = "M-M"
-BASE_SEED = 90000  # 페르소나 번호×1000 + 질의 번호×10, seed 라운드 +50 (코퍼스 7000 대와 겹치지 않게)
+BASE_SEED = 90000  # + 페르소나 번호×10000 + 질의 번호×100, seed 라운드 +50 (질의끼리·코퍼스 seed 와 겹치지 않게)
 TEMP = 0.8
 N_PER_PERSONA = {"followup": 9, "coaching": 4, "pool": 2}
 NO_ANSWER_TOTAL = 52  # followup·coaching 520개의 10%
 # 겹침 대역 경계 (Kiwi 형태소 자카드). dev 파일럿 분포로 정한다 (T04 지시: 조정은 dev 에서만).
-HIGH_MIN = 0.20
-LOW_MAX = 0.10
+HIGH_MIN = 0.30  # dev 파일럿 P03 v0 실측: low 지정 답변 0.04~0.23, high 지정 0.32~0.88
+LOW_MAX = 0.20
 MAX_ROUNDS = 3
 ROLE_KO = {
     "BACKEND": "백엔드 개발자", "FRONTEND": "프론트엔드 개발자", "DEVOPS": "인프라/DevOps 엔지니어",
@@ -114,7 +114,7 @@ def schedule(p: dict[str, Any], n_no_answer: int, idx: int) -> list[dict[str, An
     pick_gold(p, [s for s in slots if not s["no_answer"]], rng)
     for i, s in enumerate(slots):
         s["query_id"] = f"{p['pid']}-Q{i + 1:02d}"
-        s["seed"] = BASE_SEED + idx * 1000 + (i + 1) * 10
+        s["seed"] = BASE_SEED + idx * 10000 + (i + 1) * 100
     return slots
 
 
@@ -360,7 +360,7 @@ def main() -> None:
                                               encoding="utf-8")
         write_json(_out() / "manifest.json", {
             "created_at": now_iso(), "script": "ai/scripts/rag_eval/queries/generate.py", "stackup_commit": stackup_commit(),
-            "generator": GEN_MODEL, "cache_prompt": False, "temperature": TEMP, "seed_rule": "90000 + 번호×1000 + 질의×10, 라운드 +50",
+            "generator": GEN_MODEL, "cache_prompt": False, "temperature": TEMP, "seed_rule": "90000 + 번호×10000 + 질의×100, 라운드 +50",
             "bands": {"high_min": HIGH_MIN, "low_max": LOW_MAX}, "n": len(rows),
             "by_qtype": dict(Counter(r["qtype"] for r in rows)), "no_answer": sum(r["no_answer"] for r in rows)})
 
