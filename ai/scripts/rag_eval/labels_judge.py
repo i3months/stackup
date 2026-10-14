@@ -38,7 +38,7 @@ SCHEMA = {
         "required": ["fact_id", "label"], "additionalProperties": False}}},
     "required": ["judgments"], "additionalProperties": False,
 }
-RUBRIC = (
+RUBRIC_V1 = (  # T04 파일럿 1차 (Haiku–Sonnet κ 0.525: Haiku partial 의 72% 가 Sonnet none)
     "당신은 검색 평가 라벨러입니다. 한국어 지원자 문서에서 잘라 낸 텍스트 조각 하나와, 그 지원자에 관한 사실 목록이 "
     "주어집니다. 사실마다 그 텍스트가 사실을 담고 있는지 판정하세요.\n"
     "- full: 텍스트가 사실의 핵심 정보(수치·이름·도구·설정값·결과 등)를 담고 있다. 다른 말로 바꿔 쓴 것도 포함한다.\n"
@@ -47,6 +47,20 @@ RUBRIC = (
     "텍스트에 있는 것만 보고 판정하세요. 텍스트 밖의 지식이나 다른 사실로 추론하지 마세요. "
     "모든 fact_id 에 대해 정확히 한 번씩 답하세요."
 )
+RUBRIC_V2 = (  # partial 을 좁힌다: 같은 '구체적 행동·결과'를 가리켜야 하고, 같은 주제·도구·프로젝트만으로는 none
+    "당신은 검색 평가 라벨러입니다. 한국어 지원자 문서에서 잘라 낸 텍스트 조각 하나와, 그 지원자에 관한 사실 목록이 "
+    "주어집니다. 사실마다 그 텍스트가 사실을 담고 있는지 판정하세요.\n"
+    "- full: 텍스트가 사실의 핵심 정보(수치·이름·도구·설정값·결과 등)를 담고 있다. 다른 말로 바꿔 쓴 것도 포함한다.\n"
+    "- partial: 텍스트가 **바로 그 구체적인 행동이나 결과**(같은 대상에 같은 일을 한 것)를 가리키지만, 사실의 핵심 값"
+    "(수치·이름·설정값 등)이 빠졌다. 예: 사실 '쿼리 응답을 450ms 에서 120ms 로 줄였다' ↔ 텍스트 '쿼리 응답 속도를 크게 "
+    "개선했다'.\n"
+    "- none: 위에 해당하지 않는다. 같은 프로젝트·같은 회사·같은 도구·같은 주제가 나오기만 하고 그 구체적인 행동·결과를 "
+    "말하지 않으면 none 이다. 예: 사실 'Redis 분산 락으로 중복 예약을 막았다' ↔ 텍스트 'Redis 로 세션을 관리했다' 는 none.\n"
+    "텍스트에 있는 것만 보고 판정하세요. 텍스트 밖의 지식이나 다른 사실로 추론하지 마세요. 애매하면 none 쪽으로 판정하세요. "
+    "모든 fact_id 에 대해 정확히 한 번씩 답하세요."
+)
+RUBRICS = {"v1": RUBRIC_V1, "v2": RUBRIC_V2}
+RUBRIC = RUBRIC_V2
 
 
 def _labels_dir() -> Path:
@@ -68,12 +82,12 @@ def facts_block(facts: list[dict[str, Any]]) -> str:
     return "[사실 목록]\n" + "\n".join(f"- {f['fact_id']}: {f['statement']}" for f in facts)
 
 
-def request(model: str, facts: list[dict[str, Any]], text: str, kind: str) -> dict[str, Any]:
+def request(model: str, facts: list[dict[str, Any]], text: str, kind: str, rubric: str = "v2") -> dict[str, Any]:
     from llm_client import cached_text  # noqa: PLC0415
 
     return {
         "model": model, "max_tokens": 4096, "output_config": {"effort": "low"},
-        "system": [cached_text(RUBRIC)],
+        "system": [cached_text(RUBRICS[rubric])],
         "messages": [{"role": "user", "content": [
             cached_text(facts_block(facts)),  # 페르소나마다 같은 앞부분
             {"type": "text", "text": f"[{kind}]\n{text}"},
@@ -85,14 +99,14 @@ def _short(model: str) -> str:
     return "h" if "haiku" in model else "s"
 
 
-def run_requests(items: list[dict[str, Any]], model: str, *, batch: bool, run_id: str) -> dict[str, Any]:
+def run_requests(items: list[dict[str, Any]], model: str, *, batch: bool, run_id: str, rubric: str = "v2") -> dict[str, Any]:
     """items: {cid, persona_id, text, kind, fact_ids}. 반환: cid → {fact_id: label} (빠진 판정은 없음)."""
     from llm_client import LabClient, json_of  # noqa: PLC0415
 
     facts = load_facts()
     lab = LabClient(task_id=TASK_ID, budget_usd=BUDGET, run_id=run_id)
     reqs = [(it["cid"], request(model, [f for f in facts[it["persona_id"]] if f["fact_id"] in it["fact_ids"]],
-                                it["text"], it["kind"])) for it in items]
+                                it["text"], it["kind"], rubric)) for it in items]
     out: dict[str, dict[str, str]] = {}
     per = 0.0004 if "haiku" in model else 0.008  # 보수적 추정 (Batch 할인 반영 전)
     if batch:
@@ -131,7 +145,8 @@ def chunk_items(variants: list[str], personas: set[str] | None, model: str, done
 
 
 def judge_chunks(variants: list[str], personas: set[str] | None, model: str, *, batch: bool,
-                 out_name: str = "containment.jsonl", items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                 out_name: str = "containment.jsonl", items: list[dict[str, Any]] | None = None,
+                 rubric: str = "v2") -> dict[str, Any]:
     path = _labels_dir() / out_name
     old = read_jsonl(path)
     done = {(r["chunk_key"], r["fact_id"]) for r in old if r["labeler"] == model}
@@ -140,7 +155,7 @@ def judge_chunks(variants: list[str], personas: set[str] | None, model: str, *, 
     items = items if items is not None else chunk_items(variants, personas, model, done, fact_ids_of)
     if not items:
         return {"requests": 0}
-    res = run_requests(items, model, batch=batch, run_id=f"E1b-contain-{_short(model)}")
+    res = run_requests(items, model, batch=batch, run_id=f"E1b-contain-{_short(model)}", rubric=rubric)
     ts, rows, missing = _now(), [], 0
     for it in items:
         got = res["labels"].get(it["cid"])
@@ -150,7 +165,7 @@ def judge_chunks(variants: list[str], personas: set[str] | None, model: str, *, 
         for f in it["fact_ids"]:
             if got.get(f) in LABELS:
                 rows.append({"chunk_key": it["chunk_key"], "fact_id": f, "label": got[f], "labeler": model,
-                             "persona_id": it["persona_id"], "ts": ts})
+                             "persona_id": it["persona_id"], "prompt_version": rubric, "ts": ts})
             else:
                 missing += 1
     write_jsonl(path, old + rows)
@@ -202,13 +217,13 @@ def judge_prefixes(personas: set[str] | None, model: str, *, batch: bool) -> dic
                       "fact_ids": [f["fact_id"] for f in facts[pid]], "key": k})
     if not items:
         return {"requests": 0}
-    res = run_requests(items, model, batch=batch, run_id=f"E1b-prefix-{_short(model)}")
+    res = run_requests(items, model, batch=batch, run_id=f"E1b-prefix-{_short(model)}", rubric="v2")
     ts, rows = _now(), []
     for it in items:
         got = res["labels"].get(it["cid"]) or {}
         pfx, var, doc, ci = it["key"]
         rows += [{"prefix_id": pfx, "variant_id": var, "doc_id": doc, "chunk_index": ci, "fact_id": f, "label": got[f],
-                  "labeler": model, "ts": ts} for f in it["fact_ids"] if got.get(f) in LABELS]
+                  "labeler": model, "prompt_version": "v2", "ts": ts} for f in it["fact_ids"] if got.get(f) in LABELS]
     write_jsonl(path, old + rows)
     return {"requests": len(items), "pairs": len(rows), "task_spent_usd": res["spent_task_usd"]}
 
@@ -237,9 +252,37 @@ def cohen_kappa(a: list[str], b: list[str]) -> float:
     return (po - pe) / (1 - pe) if pe < 1 else 1.0
 
 
+def kappa_rerun(rubric: str, *, batch: bool) -> dict[str, Any]:
+    """kappa-sample.jsonl 의 쌍이 든 청크를 Haiku·Sonnet 모두 같은 루브릭으로 다시 판정해 κ 를 낸다 (파일럿 루브릭 조정)."""
+    pick = read_jsonl(_labels_dir() / "kappa-sample.jsonl")
+    chunks = {c["chunk_key"]: c for c in read_jsonl(_labels_dir() / "chunks.jsonl")}
+    facts = load_facts()
+    keys = sorted({(r["persona_id"], r["chunk_key"]) for r in pick})
+    out, labs = {}, {}
+    for short in ("haiku", "sonnet"):
+        m = MODELS[short]
+        name = f"containment-{short}-{rubric}-kappa.jsonl"
+        items = [{"cid": f"{_short(m)}{rubric}-{pid}-{ck[:44]}", "persona_id": pid, "chunk_key": ck,
+                  "text": chunks[ck]["body"], "kind": "텍스트 조각", "fact_ids": [f["fact_id"] for f in facts[pid]]}
+                 for pid, ck in keys]
+        done = {r["chunk_key"] for r in read_jsonl(_labels_dir() / name)}
+        items = [it for it in items if it["chunk_key"] not in done]
+        out[short] = judge_chunks([], None, m, batch=batch, out_name=name, items=items, rubric=rubric) if items else {}
+        labs[short] = {(r["chunk_key"], r["fact_id"]): r["label"] for r in read_jsonl(_labels_dir() / name)}
+    pairs = [(labs["haiku"][k], labs["sonnet"][k]) for k in ((r["chunk_key"], r["fact_id"]) for r in pick)
+             if k in labs["haiku"] and k in labs["sonnet"]]
+    bin_ = [("full" if x == "full" else "no", "full" if y == "full" else "no") for x, y in pairs]
+    return out | {"rubric": rubric, "pairs": len(pairs),
+                  "kappa_3class": round(cohen_kappa([x for x, _ in pairs], [y for _, y in pairs]), 3),
+                  "kappa_full_vs_rest": round(cohen_kappa([x for x, _ in bin_], [y for _, y in bin_]), 3),
+                  "confusion": dict(Counter(f"{x}->{y}" for x, y in pairs)),
+                  "haiku_labels": dict(Counter(x for x, _ in pairs)), "sonnet_labels": dict(Counter(y for _, y in pairs))}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["chunks", "prefixes", "auto", "sample-kappa"])
+    ap.add_argument("cmd", choices=["chunks", "prefixes", "auto", "sample-kappa", "kappa"])
+    ap.add_argument("--rubric", default="v2", choices=list(RUBRICS))
     ap.add_argument("--variants", default="")
     ap.add_argument("--personas", default="")
     ap.add_argument("--model", default="haiku", choices=list(MODELS))
@@ -250,7 +293,9 @@ def main() -> None:
     personas = set(a.personas.split(",")) if a.personas else None
     model = MODELS[a.model]
     if a.cmd == "chunks":
-        print(json.dumps(judge_chunks(variants, personas, model, batch=a.batch), ensure_ascii=False))
+        print(json.dumps(judge_chunks(variants, personas, model, batch=a.batch, rubric=a.rubric), ensure_ascii=False))
+    elif a.cmd == "kappa":
+        print(json.dumps(kappa_rerun(a.rubric, batch=a.batch), ensure_ascii=False))
     elif a.cmd == "prefixes":
         print(json.dumps(judge_prefixes(personas, model, batch=a.batch), ensure_ascii=False))
     elif a.cmd == "auto":
