@@ -198,9 +198,12 @@ class Embedder:
 
     def unload(self) -> None:
         if self._model is not None:
+            import gc
+
             import torch
 
             self._model = None
+            gc.collect()  # sentence-transformers 모델은 순환 참조가 있어 바로 안 풀린다 (T05 R-BEST: 12GB 가 차서 10배 느려짐)
             torch.cuda.empty_cache()
 
     def _kind(self, query: bool) -> str:

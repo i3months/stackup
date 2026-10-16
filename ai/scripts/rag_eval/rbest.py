@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import dataclasses
-import gc
 import json
 import sys
 from pathlib import Path
@@ -103,18 +102,27 @@ def ensure_run(cond: C.Condition, cid: str, existing: dict[tuple, str], ctx: dic
         return _out(SPLIT, f"{existing[sig]}-k{K}"), f"dev/{existing[sig]}"
     if cond.prefix == "llm" and cond.variant_id != "summary-c1000o200":
         return None, "needs_llm_prefix"
-    from index import index  # noqa: PLC0415
-    from retrieve import run  # noqa: PLC0415
-    from t05_dev import _expected, _loaded  # noqa: PLC0415
-
     d = _out(f"{SPLIT}-rbest", f"{cid}-k{K}")
     if not _done(d, len(ctx["qlist"])):
-        if _expected(cond) != _loaded(cond):
-            index(cond, "E1", LABELS_DIR)
-        run(cond, ctx["qlist"], K, run_id=f"{cid}-k{K}", out_dir=d, labels_dir=LABELS_DIR, task_id="T05",
-            experiment="E2", notes="T05 R-BEST 탐욕 선택 (dev)")
-        gc.collect()
+        # 한 프로세스에서 run 을 이어 돌리면 GPU 메모리가 새서(12GB 가 차서) 10~40배 느려진다 → run 마다 새 프로세스
+        import subprocess  # noqa: PLC0415
+
+        subprocess.run([sys.executable, "-u", __file__, "--one", json.dumps(dataclasses.asdict(cond), ensure_ascii=False),
+                        "--dir", str(d)], check=True)
     return d, f"dev-rbest/{cid}"
+
+
+def run_one(cond_json: str, d: str) -> None:
+    from index import index  # noqa: PLC0415
+    from retrieve import load_queries, run  # noqa: PLC0415
+    from t05_dev import _expected, _loaded  # noqa: PLC0415
+
+    cond = C.Condition(**json.loads(cond_json))
+    qlist = load_queries(results_dir("E1-queries") / "queries.jsonl", SPLIT)
+    if _expected(cond) != _loaded(cond):
+        index(cond, "E1", LABELS_DIR)
+    run(cond, qlist, K, run_id=f"{cond.condition_id}-k{K}", out_dir=Path(d), labels_dir=LABELS_DIR, task_id="T05",
+        experiment="E2", notes="T05 R-BEST 탐욕 선택 (dev)")
 
 
 def main() -> None:
@@ -181,4 +189,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--one" in sys.argv:
+        run_one(sys.argv[sys.argv.index("--one") + 1], sys.argv[sys.argv.index("--dir") + 1])
+    else:
+        main()

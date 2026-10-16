@@ -329,7 +329,9 @@ def run(cond: C.Condition, queries: list[dict[str, Any]], k: int, *, run_id: str
         for q in queries:
             rows.append(ranking_row(run_id, q, k, s.search(q["persona_id"], q["query_text"], k), keys))
             append_jsonl(path, rows[-1:])
+        s._reranker = None  # 재순위 모델도 GPU 에서 내린다 (emb.unload 가 gc·empty_cache)
         s.emb.unload()
+        s.conn.close()
         rr.rec["config"]["ties"] = tie_stats(rows)
         rr.n_items = len(rows)
     return rows
