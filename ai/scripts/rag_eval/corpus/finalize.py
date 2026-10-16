@@ -27,6 +27,7 @@ from corpus.generate import GEN_MODEL, load_slots  # noqa: E402
 TASK_ID = "T03"
 BUDGET = 5.0
 JUDGE = "claude-haiku-5-5"
+REVIEW_NAME = "review-sample.md"
 PRES_SCHEMA = {
     "type": "object",
     "properties": {"judgments": {"type": "array", "items": {
@@ -91,7 +92,7 @@ def apply_judgments(facts: list[dict[str, Any]], doc_id: str, parsed: dict[str, 
 def run_preserve(pids: list[str], *, batch: bool) -> dict[str, Any]:
     from llm_client import LabClient, json_of  # noqa: PLC0415
 
-    lab = LabClient(task_id=TASK_ID, budget_usd=BUDGET, run_id="E1a-preserve")
+    lab = LabClient(task_id=TASK_ID, budget_usd=BUDGET, run_id="E1a-preserve")  # T04b 는 main 에서 TASK_ID·BUDGET 을 바꾼다
     all_facts: dict[str, list[dict[str, Any]]] = {}
     reqs = []
     for pid in pids:
@@ -241,7 +242,7 @@ def review_sample(pids: list[str]) -> Path:
             ana = (corpus / d["analysis_path"]).read_text(encoding="utf-8")
             out += ["", "#### 분석 요약 (운영 프롬프트 + M-M)", "", "````markdown", ana.rstrip(), "````"]
         out.append("")
-    p = corpus / "review-sample.md"
+    p = corpus / REVIEW_NAME
     p.write_text("\n".join(out) + "\n", encoding="utf-8")
     return p
 
@@ -254,12 +255,19 @@ def main() -> None:
     ap.add_argument("--batch", action="store_true")
     ap.add_argument("--review", action="store_true")
     ap.add_argument("--review-personas", default="", help="검토 샘플 대상 (기본: 처리 대상 전부)")
+    ap.add_argument("--task", default="T03", help="원장 task (T04b 확장은 T04b, 상한 $10)")
+    ap.add_argument("--review-name", default="review-sample.md")
     a = ap.parse_args()
+    global TASK_ID, BUDGET, REVIEW_NAME
+    TASK_ID, BUDGET = a.task, {"T03": 5.0, "T04b": 10.0}[a.task]
+    REVIEW_NAME = a.review_name
     done = {p.parent.name for p in (_corpus() / "work").glob("P*/persona_meta.json")}  # _보관 폴더 제외
-    pids = sorted(done) if a.all else [p for p in a.personas.split(",") if p in done]
+    pids = sorted(done, key=lambda p: int(p[1:])) if a.all else [p for p in a.personas.split(",") if p in done]
     if a.preserve:
         print(json.dumps(run_preserve(pids, batch=a.batch), ensure_ascii=False))
-    print(json.dumps(compile_outputs(pids), ensure_ascii=False, indent=1))
+    # facts.jsonl·manifest·personas.csv 는 통째로 다시 쓰므로 항상 완료된 페르소나 전부로 만든다
+    # (T04b: --personas 로 새 페르소나만 판정해도 기존 사실이 지워지지 않게)
+    print(json.dumps(compile_outputs(sorted(done, key=lambda p: int(p[1:]))), ensure_ascii=False, indent=1))
     if a.review:
         print(review_sample(a.review_personas.split(",") if a.review_personas else pids))
 

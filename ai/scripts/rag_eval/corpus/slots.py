@@ -83,5 +83,49 @@ def main() -> None:
     print(out)
 
 
+# ---- T04b 확장 (P-025): P41~P100, 전원 test -----------------------------------------------
+EXT_FIRST, EXT_N = 41, 60
+EXT_RULE = ("T04b (P-025): 기존 40명 직군 비율 × 1.5 = 60명, 전원 test. 반올림: frontend 10.5→11, mobile 7.5→7 "
+            "(.5 두 개 중 JOB_PLAN 순서상 앞 직군을 올림). 연차는 기존과 같은 전체 순서 순환 (번호 41부터 이어서).")
+EXT_PLAN: list[tuple[str, str, int]] = [
+    ("backend", "BACKEND", 15), ("frontend", "FRONTEND", 11), ("infra", "INFRA", 9), ("data", "DATA_AI", 9),
+    ("mobile", "MOBILE", 7), ("non_eng", "PLANNING", 3), ("non_eng", "MARKETING", 3), ("non_eng", "DESIGN", 3),
+]
+
+
+def build_ext_slots() -> list[dict[str, str]]:
+    slots, i = [], EXT_FIRST - 1
+    for family, role, n in EXT_PLAN:
+        for _ in range(n):
+            slots.append({"persona_id": f"P{i + 1:02d}", "job_family": family, "job_role": role,
+                          "years_band": YEARS_BANDS[i % 4], "split": "test"})
+            i += 1
+    assert len(slots) == EXT_N and slots[-1]["persona_id"] == "P100"
+    return slots
+
+
+def extend() -> None:
+    """personas.csv 에 새 슬롯을 덧붙이고 split.json 의 test 에 넣는다. 기존 행·seed·rule 은 그대로 둔다."""
+    corpus = results_dir("E1-corpus")
+    path = corpus / "personas.csv"
+    with path.open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 40, "이미 확장됐거나 슬롯 수가 다르다"
+    ext = build_ext_slots()
+    with path.open("a", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        for s in ext:
+            w.writerow({**s, "generator": ""})
+    sp = results_dir("E1-queries") / "split.json"
+    split = json.loads(sp.read_text(encoding="utf-8"))
+    split["test"] = split["test"] + [s["persona_id"] for s in ext]
+    split["ext"] = {"task": "T04b", "decision": "P-025", "rule": EXT_RULE, "added_test": [s["persona_id"] for s in ext],
+                    "created_at": now_iso(), "stackup_commit": stackup_commit(),
+                    "note": "확장은 무작위 배정이 없다 (전원 test). 기존 dev 12 / test 28 배정은 seed·rule 그대로"}
+    sp.write_text(json.dumps(split, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    from collections import Counter
+    print(Counter(s["years_band"] for s in ext), Counter(s["job_role"] for s in ext))
+
+
 if __name__ == "__main__":
-    main()
+    extend() if sys.argv[1:] == ["extend"] else main()

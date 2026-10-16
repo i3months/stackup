@@ -33,6 +33,7 @@ TEMP_EXTRACT = 0.1  # 사실 추출
 FACT_MAX_TOKENS = 4096  # 사실 추출 출력 상한 (반복 루프 차단, 정상 최대 966)
 ENGINEERING = {"backend", "frontend", "infra", "data", "mobile"}
 CAREER_BANDS = {"4~7", "8+"}  # 경력기술서 추가 (관리자 T03 답변 1)
+EXT_FIRST_IDX = 41  # T04b 확장 첫 번호 (cache_prompt=false)
 
 DOMAINS = ["이커머스", "핀테크·결제", "물류·배송", "헬스케어", "에듀테크", "게임", "미디어·콘텐츠", "공공·행정",
            "제조·스마트팩토리", "여행·숙박", "부동산·프롭테크", "모빌리티", "광고·마케팅 플랫폼", "SaaS·B2B 협업툴",
@@ -363,7 +364,8 @@ class Generator:
             raise RuntimeError(f"{slot['persona_id']} 설계서 검증 실패: {problems}")
         plan["_meta"] = {"domain": domain, "seed": s, "generator": GEN_MODEL, "attempts": len(history),
                          "seed_round": rnd, "history": history,
-                         "timeline": timeline, "generator_commit": stackup_commit()}
+                         "timeline": timeline, "generator_commit": stackup_commit(),
+                         "cache_prompt": self.llm.cache_prompt}
         p.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
         return plan
 
@@ -692,17 +694,20 @@ def main() -> None:
     slots = load_slots()
     want = [s for s in slots if a.all or s["persona_id"] in a.personas.split(",")]
     repos = json.loads(Path(a.repos).read_text(encoding="utf-8")) if Path(a.repos).exists() else {}
-    # E1a 코퍼스는 서버 기본값(프롬프트 캐시 켜짐)으로 만들었다. 재현 단위 = 같은 순서의 전체 실행 (P-018)
-    llm = LocalLLM(base_url(GEN_MODEL), model=GEN_MODEL, log_path=results_dir("E1-corpus") / "work" / "calls.jsonl",
-                   cache_prompt=None)
-    gen = Generator(llm, repos=repos)
+    # E1a 코퍼스(P01~P40)는 서버 기본값(프롬프트 캐시 켜짐)으로 만들었다. 재현 단위 = 같은 순서의 전체 실행 (P-018).
+    # T04b 확장(P41~)은 cache_prompt=false 로 만든다 (P-025) — 페르소나 단위로 재현된다.
+    log = results_dir("E1-corpus") / "work" / "calls.jsonl"
+    llm_t03 = LocalLLM(base_url(GEN_MODEL), model=GEN_MODEL, log_path=log, cache_prompt=None)
+    llm_ext = LocalLLM(base_url(GEN_MODEL), model=GEN_MODEL, log_path=log, cache_prompt=False)
+    gen = Generator(llm_t03, repos=repos)
     for s in want:
         free = windows_free_gb()
         if free is not None and free < MIN_WINDOWS_FREE_GB:
             print(f"STOP Windows 여유 메모리 {free:.1f}GB < {MIN_WINDOWS_FREE_GB}GB — 관리자 보고 필요", flush=True)
             sys.exit(3)
         idx = int(s["persona_id"][1:])
-        print(f"== {s['persona_id']} {s['job_role']} {s['years_band']}", flush=True)
+        gen.llm = llm_ext if idx > EXT_FIRST_IDX - 1 else llm_t03
+        print(f"== {s['persona_id']} {s['job_role']} {s['years_band']} cache_prompt={gen.llm.cache_prompt}", flush=True)
         try:
             m = gen.persona(s, idx)
             print(f"   docs={len(m['docs'])} facts={m['n_facts']} pairs={m['n_confusable_pairs']} {m['elapsed_sec']}s", flush=True)

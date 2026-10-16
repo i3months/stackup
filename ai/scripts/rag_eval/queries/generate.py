@@ -85,11 +85,19 @@ def no_answer_personas(all_pids: list[str]) -> set[str]:
 
 def schedule(p: dict[str, Any], n_no_answer: int, idx: int) -> list[dict[str, Any]]:
     rng = random.Random(BASE_SEED + idx * 1000)
-    slots: list[dict[str, Any]] = []
     # 정답 없음: 2개면 followup 1 + coaching 1, 1개면 followup (9:4 비율에 가깝게)
     na = {"followup": 1, "coaching": 1 if n_no_answer == 2 else 0}
+    slots, _ = _schedule(p, N_PER_PERSONA, na, rng, idx, first_q=1, pool_modes=("INTEGRATED", "JOB_TAILORED"))
+    return slots
+
+
+def _schedule(p: dict[str, Any], plan: dict[str, int], na: dict[str, int], rng: random.Random, idx: int, *,
+              first_q: int, pool_modes: tuple[str, ...], prior: tuple[Counter, Counter] | None = None,
+              ) -> tuple[list[dict[str, Any]], tuple[Counter, Counter]]:
+    """schedule 의 본체. T04 의 15개는 rng 호출 순서까지 그대로다 (T04b 확장이 같은 함수를 쓴다)."""
+    slots: list[dict[str, Any]] = []
     quality_cycle = {"followup": ["strong", "weak", "dontknow"], "coaching": ["strong", "weak"], "pool": ["strong"]}
-    for qtype, n in N_PER_PERSONA.items():
+    for qtype, n in plan.items():
         n_na = na.get(qtype, 0)
         qs = quality_cycle[qtype]
         start = rng.randrange(len(qs))
@@ -113,21 +121,25 @@ def schedule(p: dict[str, Any], n_no_answer: int, idx: int) -> list[dict[str, An
     for s in slots:
         s.setdefault("overlap_band", None)
     pools = [s for s in slots if s["qtype"] == "pool"]
-    for s, mode in zip(pools, ("INTEGRATED", "JOB_TAILORED")):  # 자기소개만 / 자기소개 + JD
+    assert len(pools) <= len(pool_modes)
+    for s, mode in zip(pools, pool_modes):  # 자기소개만 / 자기소개 + JD
         s["mode"] = mode
-    pick_gold(p, [s for s in slots if not s["no_answer"]], rng)
+    counters = pick_gold(p, [s for s in slots if not s["no_answer"]], rng, prior=prior)
     for i, s in enumerate(slots):
-        s["query_id"] = f"{p['pid']}-Q{i + 1:02d}"
-        s["seed"] = BASE_SEED + idx * 10000 + (i + 1) * 100
-    return slots
+        q = first_q + i
+        s["query_id"] = f"{p['pid']}-Q{q:02d}"
+        s["seed"] = BASE_SEED + idx * 10000 + q * 100
+    return slots, counters
 
 
-def pick_gold(p: dict[str, Any], slots: list[dict[str, Any]], rng: random.Random) -> None:
+def pick_gold(p: dict[str, Any], slots: list[dict[str, Any]], rng: random.Random,
+              prior: tuple[Counter, Counter] | None = None) -> tuple[Counter, Counter]:
     """근거 사실 1~3개. 주 사실은 (문서 유형, 사실 유형, 요약 보존) 조합이 고르게 돌도록 고르고,
-    나머지는 같은 문서·같은 경험의 사실에서 고른다. 페르소나 안에서 주 사실은 겹치지 않게 한다."""
+    나머지는 같은 문서·같은 경험의 사실에서 고른다. 페르소나 안에서 주 사실은 겹치지 않게 한다
+    (사실이 질의보다 적으면 사용 횟수가 적은 것부터 재사용 — T04b. prior 는 앞선 질의의 사용 횟수)."""
     facts = [f for f in p["facts"]]
-    used: Counter = Counter()
-    cells: Counter = Counter()
+    used: Counter = Counter(prior[0]) if prior else Counter()
+    cells: Counter = Counter(prior[1]) if prior else Counter()
     for s in slots:
         def score(f: dict[str, Any]) -> tuple:
             cell = (f["doc_id"].split("-", 1)[1], f["fact_type"], f["preserved_in_summary"])
@@ -143,6 +155,48 @@ def pick_gold(p: dict[str, Any], slots: list[dict[str, Any]], rng: random.Random
                  and main["experience_id"] and f["experience_id"] == main["experience_id"]]
         rng.shuffle(mates)
         s["gold"] = [main] + mates[: k - 1]
+    return used, cells
+
+
+# ---- T04b 확장 (P-025): test 질의 25개/명 ---------------------------------------------------
+ORIG_PIDS = [f"P{i:02d}" for i in range(1, 41)]  # T04 의 정답 없음 배정은 이 40명으로 고정 (확장이 바꾸지 않게)
+N_TEST25 = {"followup": 15, "coaching": 6, "pool": 4}  # 60 · 25 · 15 % (9·4·2 × 25/15 = 15·6.67·3.33 → 15·6·4)
+N_EXT10 = {"followup": 6, "coaching": 2, "pool": 2}  # 기존 test 28명 + 10 → 15·6·4
+POOL_MODES4 = ("INTEGRATED", "JOB_TAILORED", "INTEGRATED", "JOB_TAILORED")
+EXT_NA_PERSONAS = 22  # 기존 test 28명 중 확장분에 정답 없음 1개를 받는 수 (추가 followup·coaching 224개의 ≈10%)
+
+
+def ext_no_answer(test_orig: list[str]) -> set[str]:
+    return set(random.Random(BASE_SEED + 2).sample(sorted(test_orig), EXT_NA_PERSONAS))
+
+
+def schedule_test25(p: dict[str, Any], idx: int) -> list[dict[str, Any]]:
+    """새 test 페르소나 (P41~): 25개. 정답 없음은 followup 1 + coaching 1 (21개의 9.5%)."""
+    rng = random.Random(BASE_SEED + idx * 1000)
+    slots, _ = _schedule(p, N_TEST25, {"followup": 1, "coaching": 1}, rng, idx, first_q=1, pool_modes=POOL_MODES4)
+    return slots
+
+
+def schedule_ext10(p: dict[str, Any], n_no_answer_t04: int, idx: int, ext_na: bool) -> list[dict[str, Any]]:
+    """기존 test 페르소나의 Q16~Q25. 앞 15개의 근거 사실 사용 횟수를 이어받아 겹침을 최소로 한다."""
+    rng0 = random.Random(BASE_SEED + idx * 1000)
+    na0 = {"followup": 1, "coaching": 1 if n_no_answer_t04 == 2 else 0}
+    _, prior = _schedule(p, N_PER_PERSONA, na0, rng0, idx, first_q=1, pool_modes=("INTEGRATED", "JOB_TAILORED"))
+    rng = random.Random(BASE_SEED + idx * 1000 + 500)
+    slots, _ = _schedule(p, N_EXT10, {"followup": 1 if ext_na else 0}, rng, idx, first_q=16,
+                         pool_modes=("INTEGRATED", "JOB_TAILORED"), prior=prior)
+    return slots
+
+
+def add_gold_reuse_rank(rows: list[dict[str, Any]]) -> None:
+    """주 근거 사실(gold_fact_ids[0])이 그 페르소나에서 몇 번째로 쓰였는지 (질의 번호 순, 1 = 첫 사용)."""
+    seen: Counter = Counter()
+    for r in sorted(rows, key=lambda r: (r["persona_id"], int(r["query_id"].rsplit("Q", 1)[1]))):
+        if r["gold_fact_ids"]:
+            seen[(r["persona_id"], r["gold_fact_ids"][0])] += 1
+            r["gold_reuse_rank"] = seen[(r["persona_id"], r["gold_fact_ids"][0])]
+        else:
+            r["gold_reuse_rank"] = None
 
 
 # ---- 프롬프트 -------------------------------------------------------------------
@@ -334,10 +388,12 @@ class QueryGen:
         return base
 
 
-def generate_persona(gen: QueryGen, p: dict[str, Any], n_na: int, idx: int) -> list[dict[str, Any]]:
+def generate_persona(gen: QueryGen, p: dict[str, Any], n_na: int, idx: int,
+                     slots: list[dict[str, Any]] | None = None, suffix: str = "") -> list[dict[str, Any]]:
+    """slots 가 없으면 T04 의 15개 일정. suffix 는 작업 파일 이름 (T04b 확장분은 '.ext')."""
     from common import append_jsonl  # noqa: PLC0415
 
-    w = _out() / "work" / f"{p['pid']}.jsonl"
+    w = _out() / "work" / f"{p['pid']}{suffix}.jsonl"
     if w.exists():
         return [json.loads(x) for x in w.read_text(encoding="utf-8").splitlines() if x.strip()]
     # 질의마다 .partial 에 덧붙이고 다 끝나면 이름을 바꾼다. 중간에 끊기면 끝난 질의는 건너뛴다
@@ -346,7 +402,7 @@ def generate_persona(gen: QueryGen, p: dict[str, Any], n_na: int, idx: int) -> l
     out = [json.loads(x) for x in part.read_text(encoding="utf-8").splitlines() if x.strip()] if part.exists() else []
     done = {r["query_id"] for r in out}
     t0 = time.monotonic()
-    for s in schedule(p, n_na, idx):
+    for s in (slots if slots is not None else schedule(p, n_na, idx)):
         if s["query_id"] in done:
             continue
         rec = gen.one(p, s)
@@ -367,13 +423,24 @@ def main() -> None:
     split = json.loads((_out() / "split.json").read_text(encoding="utf-8"))
     all_pids = sorted(split["dev"] + split["test"])
     pids = all_pids if a.all else a.personas.split(",")
-    two = no_answer_personas(all_pids)
+    two = no_answer_personas(ORIG_PIDS)  # T04 배정 고정 (split 에 확장 페르소나가 들어와도 바뀌지 않게)
+    test_orig = sorted(set(split["test"]) & set(ORIG_PIDS))
+    ext_na = ext_no_answer(test_orig)
     llm = LocalLLM(base_url(GEN_MODEL), model=GEN_MODEL, log_path=_out() / "work" / "calls.jsonl")  # cache_prompt=False
     gen = QueryGen(llm)
     rows = []
     for pid in pids:
         p = load_persona(pid)
-        rows += generate_persona(gen, p, 2 if pid in two else 1, int(pid[1:]))
+        idx = int(pid[1:])
+        if pid in ORIG_PIDS:
+            rows += generate_persona(gen, p, 2 if pid in two else 1, idx)
+            if pid in test_orig:  # T04b: Q16~Q25
+                rows += generate_persona(gen, p, 0, idx, slots=schedule_ext10(p, 2 if pid in two else 1, idx,
+                                                                              pid in ext_na), suffix=".ext")
+        else:  # T04b 새 test 페르소나: 25개
+            assert pid in split["test"]
+            rows += generate_persona(gen, p, 0, idx, slots=schedule_test25(p, idx))
+    add_gold_reuse_rank(rows)
     if a.all:
         (_out() / "queries.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
                                               encoding="utf-8")
@@ -382,7 +449,12 @@ def main() -> None:
             "generator": GEN_MODEL, "cache_prompt": False, "temperature": TEMP, "seed_rule": "90000 + 번호×10000 + 질의×100, 라운드 +50",
             "bands": {"measure": "overlap_coverage", "high_min": HIGH_MIN, "low_max": LOW_MAX,
                       "mid": "0.5 < coverage < 0.7"}, "n": len(rows),
-            "by_qtype": dict(Counter(r["qtype"] for r in rows)), "no_answer": sum(r["no_answer"] for r in rows)})
+            "by_qtype": dict(Counter(r["qtype"] for r in rows)), "no_answer": sum(r["no_answer"] for r in rows),
+            "t04b": {"decision": "P-025", "new_test_per_persona": N_TEST25, "orig_test_extension": N_EXT10,
+                     "orig_test_ext_no_answer_personas": EXT_NA_PERSONAS,
+                     "ext_schedule_rng": "BASE_SEED + 번호×1000 + 500 (확장분), 앞 15개 근거 사실 사용 횟수를 이어받음",
+                     "gold_reuse_rank": "주 근거 사실이 그 페르소나에서 몇 번째로 쓰였는지 (질의 번호 순)",
+                     "no_answer_t04": "T04 의 정답 없음 배정은 P01~P40 으로 고정"}})
 
 
 if __name__ == "__main__":
