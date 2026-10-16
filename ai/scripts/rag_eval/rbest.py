@@ -153,7 +153,7 @@ def main() -> None:
     base = allc["B0"]
     existing = {}
     for cid, c in allc.items():
-        if cid in ("R-EMB-4m", "R-EMB-1-bf16", "R-CH-1500", "R-CH-head"):
+        if cid in ("R-EMB-4m", "R-EMB-1-bf16", "R-CH-1500", "R-CH-head", "R-RR-1-q512"):
             continue
         existing.setdefault(signature(c), cid)
     qlist = load_queries(results_dir("E1-queries") / "queries.jsonl", SPLIT)

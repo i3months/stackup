@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from collections import Counter
 from pathlib import Path
@@ -102,6 +103,8 @@ LIMIT %(cand)s
 KIWI_POS = ("NNG", "NNP", "NNB", "NR", "SL", "SH", "SN", "XR", "VV", "VA", "MAG")
 BM25_K1 = 1.2
 BM25_B = 0.75
+# 재순위 배치 크기 (P-025). 기본 None = CrossEncoder 기본(32). 동결 전 dev 단언(상위 k 순위 동일, 점수 차 ≤ 1e-4) 뒤에 정한다.
+RERANK_BATCH = int(os.environ["RAG_RERANK_BATCH"]) if os.environ.get("RAG_RERANK_BATCH") else None
 _kiwi = None
 
 
@@ -261,7 +264,16 @@ class Searcher:
         lat["search"] = (time.perf_counter() - t0) * 1000
         if cond.reranker != "none":
             t0 = time.perf_counter()
-            scores = self.reranker.predict([(query_text, h["text"]) for h in hits]) if hits else []
+            rq = query_text
+            if cond.rerank_query_tokens:  # R-RR-1-q512: 재순위 입력의 질의만 앞 N 토큰 (P-025)
+                tok = self.reranker.tokenizer
+                ids = tok(query_text, add_special_tokens=False)["input_ids"]
+                if len(ids) > cond.rerank_query_tokens:
+                    rq = tok.decode(ids[: cond.rerank_query_tokens], skip_special_tokens=True)
+            # 배치 분할 (P-025 실행 규칙): CrossEncoder.predict 는 길이순으로 정렬해 batch_size 씩 나눈다. 기본 32 면
+            # 후보 20쌍이 한 배치라 긴 pool 질의에서 GPU 메모리를 넘는다. RERANK_BATCH 로 나눈다 (None = 기본값 그대로).
+            kw = {"batch_size": RERANK_BATCH} if RERANK_BATCH else {}
+            scores = self.reranker.predict([(rq, h["text"]) for h in hits], **kw) if hits else []
             lat["rerank"] = (time.perf_counter() - t0) * 1000
             for n, (h, s) in enumerate(zip(hits, scores)):
                 h["pre_rerank_rank"] = n + 1
@@ -317,7 +329,7 @@ def run(cond: C.Condition, queries: list[dict[str, Any]], k: int, *, run_id: str
         task_id: str, experiment: str, production_sql: bool = False, notes: str = "") -> list[dict[str, Any]]:
     model_ids = [cond.embedder] + ([cond.reranker] if cond.reranker != "none" else [])
     cfg = cond.as_dict() | {"k": k, "n_queries": len(queries), "production_sql": production_sql,
-                            "labels_dir": labels_dir, "device": DEVICE, "bm25": {"k1": BM25_K1, "b": BM25_B, "pos": KIWI_POS}
+                            "labels_dir": labels_dir, "device": DEVICE, "rerank_batch": RERANK_BATCH, "bm25": {"k1": BM25_K1, "b": BM25_B, "pos": KIWI_POS}
                             if "kiwi" in cond.retrieval else None}
     keys = load_chunk_keys(labels_dir, cond.variant_id)
     with RunRecorder(out_dir, run_id=run_id, task_id=task_id, experiment=experiment, condition_id=cond.condition_id,

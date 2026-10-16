@@ -44,6 +44,8 @@ class Condition:
     reranker: str
     rerank_stage1: int
     exploratory: bool
+    # 재순위 입력의 질의만 앞 N 토큰으로 자른다 (재순위 모델 토크나이저 기준). None = 자르지 않음 (P-025, R-RR-1-q512)
+    rerank_query_tokens: int | None = None
 
     @property
     def variant_id(self) -> str:
@@ -77,7 +79,10 @@ class Condition:
 
 
 def validate(d: dict[str, Any], src: str) -> Condition:
-    missing = set(Condition.__dataclass_fields__) - set(d)
+    from dataclasses import MISSING  # noqa: PLC0415
+
+    required = {k for k, f in Condition.__dataclass_fields__.items() if f.default is MISSING}
+    missing = required - set(d)
     extra = set(d) - set(Condition.__dataclass_fields__)
     if missing or extra:
         raise ValueError(f"{src}: 필드 누락 {sorted(missing)} / 알 수 없는 필드 {sorted(extra)}")

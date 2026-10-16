@@ -17,20 +17,21 @@ META = {"condition_id", "description", "exploratory"}
 
 
 RAW_CHUNKING = {"R-SRCraw-CH-500", "R-SRCraw-CH-1500", "R-SRCraw-CH-head"}  # P-019 원문 위 청킹 탐색
+RR_QUERY_TRUNC = {"R-RR-1-q512"}  # P-025: R-RR-1 기준으로 재순위 질의 자르기만 바꾼다
 
 
 def test_condition_set():
     allc = C.load_all()
-    assert len(allc) == 22
+    assert len(allc) == 23
     assert sum(not c.exploratory for c in allc.values()) == 17
-    assert {"R-EMB-4m", "R-EMB-1-bf16"} | RAW_CHUNKING == {k for k, c in allc.items() if c.exploratory}
+    assert {"R-EMB-4m", "R-EMB-1-bf16"} | RAW_CHUNKING | RR_QUERY_TRUNC == {k for k, c in allc.items() if c.exploratory}
 
 
 def test_one_factor_at_a_time():
     allc = C.load_all()
     for cid, c in allc.items():
         # 원문 청킹 탐색 조건은 R-SRC-raw 를 기준으로 한 요인만 바꾼다
-        base = asdict(allc["R-SRC-raw" if cid in RAW_CHUNKING else "B0"])
+        base = asdict(allc["R-SRC-raw" if cid in RAW_CHUNKING else "R-RR-1" if cid in RR_QUERY_TRUNC else "B0"])
         diff = {k for k, v in asdict(c).items() if base[k] != v} - META
         if cid == "B0":
             assert not diff
@@ -42,6 +43,8 @@ def test_one_factor_at_a_time():
         assert len(factors) <= 1, (cid, diff)
         if cid == "R-EMB-1-bf16":
             assert diff == {"dtype"}
+        if cid in RR_QUERY_TRUNC:
+            assert diff == {"rerank_query_tokens"}, (cid, diff)
         if cid in RAW_CHUNKING:
             assert factors == {"chunking"}, (cid, diff)
 

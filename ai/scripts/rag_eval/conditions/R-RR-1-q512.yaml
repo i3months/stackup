@@ -1,0 +1,18 @@
+# R-RR-1-q512 — 탐색 (P-025): R-RR-1 에서 재순위 입력의 질의만 앞 512 토큰으로 자른다. R-BEST 후보 아님.
+condition_id: R-RR-1-q512
+description: "탐색: 재순위 bge-reranker-v2-m3, 재순위 입력의 질의만 앞 512 토큰 (P-025, pool 긴 질의 효과)"
+index_source: summary        # summary | raw | both
+chunk_size: 1000
+chunk_overlap: 200
+chunk_mode: recursive        # recursive (헤딩 → 크기) | heading (헤딩 단위만, 최대 chunk_size)
+prefix: deterministic        # deterministic | none | llm
+embedder: EMB-1              # common.MODELS
+query_instruction: none      # none | query (모델 카드 prompt_name="query")
+dtype: fp32                  # fp32 | bf16
+truncate_dim: null           # MRL 절단 차원 (R-EMB-4m 만)
+retrieval: hybrid_simple     # hybrid_simple | vector | hybrid_kiwi | bm25_kiwi
+cand: k                      # k | 4k | 정수
+reranker: RR-1               # none | RR-1 | RR-2
+rerank_stage1: 20            # 재순위 1단계 cand = limit
+exploratory: true
+rerank_query_tokens: 512
