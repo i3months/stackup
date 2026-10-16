@@ -325,7 +325,10 @@ def main() -> None:
     ap.add_argument("--model", default="haiku", choices=list(MODELS))
     ap.add_argument("--batch", action="store_true")
     ap.add_argument("--n", type=int, default=180)
+    ap.add_argument("--task", default="T04", choices=["T04", "T04b"], help="원장 task (T04b 확장은 상한 $10)")
     a = ap.parse_args()
+    global TASK_ID, BUDGET
+    TASK_ID, BUDGET = a.task, {"T04": 20.0, "T04b": 10.0}[a.task]
     variants = [v for v in a.variants.split(",") if v]
     personas = set(a.personas.split(",")) if a.personas else None
     model = MODELS[a.model]

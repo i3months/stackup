@@ -102,6 +102,10 @@ def run_preserve(pids: list[str], *, batch: bool) -> dict[str, Any]:
     missing = 0
     if batch and reqs:
         bid = lab.submit_batch([(d, r) for d, r, _ in reqs], estimate_usd=0.0005 * len(reqs), json_schema=PRES_SCHEMA)
+        from common import append_jsonl  # noqa: PLC0415
+
+        append_jsonl(_corpus() / "batches.jsonl", [{"batch_id": bid, "task": TASK_ID, "run_id": "E1a-preserve", "n": len(reqs),
+                                                    "ts": now_iso()}])  # 기다리기 전에 기록 (끊겨도 회수 가능)
         print(f"batch {bid} ({len(reqs)}건) 대기")
         lab.wait_batch(bid, poll_sec=30)
         res = lab.collect_batch(bid)
