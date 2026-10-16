@@ -330,7 +330,9 @@ def run(cond: C.Condition, queries: list[dict[str, Any]], k: int, *, run_id: str
     model_ids = [cond.embedder] + ([cond.reranker] if cond.reranker != "none" else [])
     cfg = cond.as_dict() | {"k": k, "n_queries": len(queries), "production_sql": production_sql,
                             "labels_dir": labels_dir, "device": DEVICE, "rerank_batch": RERANK_BATCH, "bm25": {"k1": BM25_K1, "b": BM25_B, "pos": KIWI_POS}
-                            if "kiwi" in cond.retrieval else None}
+                            if "kiwi" in cond.retrieval else None,
+                            "llm_prefix_cache_prompt": ("요약 부분 false (T04), 원문 부분 true (P-026)" if cond.prefix == "llm"
+                                                        else None)}
     keys = load_chunk_keys(labels_dir, cond.variant_id)
     with RunRecorder(out_dir, run_id=run_id, task_id=task_id, experiment=experiment, condition_id=cond.condition_id,
                      config=cfg, model_ids=model_ids, notes=notes) as rr:

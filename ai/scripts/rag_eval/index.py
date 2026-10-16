@@ -145,30 +145,49 @@ LLM_PREFIX_USER = (  # Anthropic Contextual Retrieval 프롬프트의 한국어 
 )
 
 
+def llm_prefix_cache() -> dict[str, dict[str, Any]]:
+    """key → {"prefix", "cache_prompt"}. cache_prompt 가 없는 옛 레코드는 캐시 끔으로 만든 것이다 (T04·T05 P-026 이전)."""
+    cache_p = CACHE_DB.parent / "llm_prefix.jsonl"
+    cache: dict[str, dict[str, Any]] = {}
+    if cache_p.exists():
+        for ln in cache_p.read_text(encoding="utf-8").splitlines():
+            r = json.loads(ln)
+            cache[r["key"]] = {"prefix": r["prefix"], "cache_prompt": r.get("cache_prompt", False)}
+    return cache
+
+
 def llm_prefixes(rows: list[dict[str, Any]], docs: dict[str, Doc], *, seed: int = 4242) -> dict[tuple, str]:
-    """PFX-llm: M-M 이 청크별 1~2문장. (문서 해시, 본문 해시) 로 캐시."""
+    """PFX-llm: M-M 이 청크별 1~2문장. (문서 해시, 본문 해시) 로 캐시.
+
+    프롬프트 캐시 (P-026): 요약 부분은 cache_prompt=false (T04). 원문 부분은 문서 전체(평균 2만여 토큰)가 프롬프트에
+    들어가 캐시 끔이면 청크당 30초여서 cache_prompt=true 로 만든다. 이때 출력이 서버 캐시 상태에 따라 달라질 수 있어
+    (P-018) 재현 단위는 '같은 순서의 전체 실행'이다. rows 는 doc_id → chunk_index 순이라 같은 문서의 청크가 연속이고,
+    실행 순서를 E1-labels/llm_prefix_runs.jsonl 에 남긴다. 레코드마다 cache_prompt 를 기록한다."""
+    from common import append_jsonl, now_iso, results_dir  # noqa: PLC0415
     from local_llm import LocalLLM  # noqa: PLC0415
     from servers.llama_server import base_url  # noqa: PLC0415
 
     cache_p = CACHE_DB.parent / "llm_prefix.jsonl"
-    cache: dict[str, str] = {}
-    if cache_p.exists():
-        for ln in cache_p.read_text(encoding="utf-8").splitlines():
-            r = json.loads(ln)
-            cache[r["key"]] = r["prefix"]
-    llm = LocalLLM(base_url("M-M"), model="M-M", log_path=CACHE_DB.parent / "llm_prefix_calls.jsonl")
+    cache = llm_prefix_cache()
+    log = CACHE_DB.parent / "llm_prefix_calls.jsonl"
+    llms = {False: LocalLLM(base_url("M-M"), model="M-M", log_path=log, cache_prompt=False),
+            True: LocalLLM(base_url("M-M"), model="M-M", log_path=log, cache_prompt=True)}
+    order_p = results_dir("E1-labels") / "llm_prefix_runs.jsonl"
     out = {}
     for r in rows:
         d = docs[r["doc_id"]]
         src = d.analysis_md if r["part"] == "summary" else d.raw_text
         key = sha256(src) + ":" + r["chunk_key"]
         if key not in cache:
+            cp = r["part"] != "summary"
             msgs = [{"role": "system", "content": LLM_PREFIX_SYSTEM},
                     {"role": "user", "content": LLM_PREFIX_USER.format(doc=src, chunk=r["body"])}]
-            cache[key] = llm.chat(msgs, seed=seed, temperature=0.0, max_tokens=200, tag="pfx-llm").strip()
-            with cache_p.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"key": key, "prefix": cache[key]}, ensure_ascii=False) + "\n")
-        out[(r["doc_id"], r["chunk_index"])] = cache[key] + "\n\n"
+            text = llms[cp].chat(msgs, seed=seed, temperature=0.0, max_tokens=200, tag="pfx-llm").strip()
+            cache[key] = {"prefix": text, "cache_prompt": cp}
+            append_jsonl(cache_p, [{"key": key, "prefix": text, "cache_prompt": cp}])
+            append_jsonl(order_p, [{"variant_id": r["variant_id"], "doc_id": r["doc_id"], "chunk_index": r["chunk_index"],
+                                    "key": key, "cache_prompt": cp, "ts": now_iso()}])
+        out[(r["doc_id"], r["chunk_index"])] = cache[key]["prefix"] + "\n\n"
     return out
 
 
@@ -356,6 +375,12 @@ def chunks_and_prefixes(cond: C.Condition, corpus: str, out: str) -> tuple[list[
         pref_rows = [{"variant_id": r["variant_id"], "doc_id": r["doc_id"], "chunk_index": r["chunk_index"],
                       "prefix_id": cond.prefix, "prefix_text": prefixes[(r["doc_id"], r["chunk_index"])],
                       "generator": gen} for r in rows]
+        if cond.prefix == "llm":  # P-026: 레코드마다 프롬프트 캐시 설정
+            cache = llm_prefix_cache()
+            for r, pr in zip(rows, pref_rows):
+                d = by_id[r["doc_id"]]
+                src = d.analysis_md if r["part"] == "summary" else d.raw_text
+                pr["cache_prompt"] = cache[sha256(src) + ":" + r["chunk_key"]]["cache_prompt"]
         merge_jsonl(outdir / "prefixes.jsonl", pref_rows, ("variant_id", "prefix_id"), (cond.variant_id, cond.prefix))
     return rows, prefixes, gen
 
