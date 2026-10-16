@@ -172,6 +172,39 @@ def judge_chunks(variants: list[str], personas: set[str] | None, model: str, *, 
     return {"requests": len(items), "pairs": len(rows), "missing_pairs": missing, "task_spent_usd": res["spent_task_usd"]}
 
 
+def recover_chunks(variants: list[str], model: str, batch_ids: list[str], rubric: str = "v2") -> dict[str, Any]:
+    """제출은 끝났는데 containment 를 쓰기 전에 프로세스가 죽은 경우 (T04: 2026-10-14 전원 꺼짐).
+    같은 미판정 묶음을 다시 만들어 custom_id 로 이미 끝난 Batch 결과와 맞춘다. 재제출 없음. collect_batch 는 원장에
+    빠진 (batch_id, custom_id) 만 기록한다."""
+    from llm_client import LabClient, json_of  # noqa: PLC0415
+
+    path = _labels_dir() / "containment.jsonl"
+    old = read_jsonl(path)
+    done = {(r["chunk_key"], r["fact_id"]) for r in old if r["labeler"] == model}
+    facts = load_facts()
+    items = {it["cid"]: it for it in chunk_items(variants, None, model, done,
+                                                 {p: [f["fact_id"] for f in fs] for p, fs in facts.items()})}
+    lab = LabClient(task_id=TASK_ID, budget_usd=BUDGET, run_id=f"E1b-contain-{_short(model)}")
+    ts, rows, matched, missing = _now(), [], 0, 0
+    for bid in batch_ids:
+        res = lab.collect_batch(bid)
+        for cid, r in res.items():
+            it = items.get(cid)
+            if it is None or r["type"] != "succeeded":
+                continue
+            matched += 1
+            got = {j["fact_id"]: j["label"] for j in json_of(r["message"])["judgments"]}
+            for f in it["fact_ids"]:
+                if got.get(f) in LABELS:
+                    rows.append({"chunk_key": it["chunk_key"], "fact_id": f, "label": got[f], "labeler": model,
+                                 "persona_id": it["persona_id"], "rubric_version": rubric, "ts": ts})
+                else:
+                    missing += 1
+    write_jsonl(path, old + rows)
+    return {"unjudged_items": len(items), "matched": matched, "pairs": len(rows), "missing_pairs": missing,
+            "task_spent_usd": round(lab.spent_usd(), 6)}
+
+
 def auto_pass(variants: list[str]) -> dict[str, Any]:
     """원문 변형 자동 full (SPEC §4.3-1). LLM 판정 뒤에 덮어쓰는 행으로 추가한다 (Labels 는 auto 를 LLM 보다 우선)."""
     from index import load_corpus  # noqa: PLC0415  (newline="" 원문)
@@ -281,7 +314,8 @@ def kappa_rerun(rubric: str, *, batch: bool) -> dict[str, Any]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["chunks", "prefixes", "auto", "sample-kappa", "kappa"])
+    ap.add_argument("cmd", choices=["chunks", "prefixes", "auto", "sample-kappa", "kappa", "recover"])
+    ap.add_argument("--batches", default="", help="recover: 결과를 다시 받을 batch id 목록")
     ap.add_argument("--rubric", default="v2", choices=list(RUBRICS))
     ap.add_argument("--variants", default="")
     ap.add_argument("--personas", default="")
@@ -294,6 +328,8 @@ def main() -> None:
     model = MODELS[a.model]
     if a.cmd == "chunks":
         print(json.dumps(judge_chunks(variants, personas, model, batch=a.batch, rubric=a.rubric), ensure_ascii=False))
+    elif a.cmd == "recover":
+        print(json.dumps(recover_chunks(variants, model, a.batches.split(","), a.rubric), ensure_ascii=False))
     elif a.cmd == "kappa":
         print(json.dumps(kappa_rerun(a.rubric, batch=a.batch), ensure_ascii=False))
     elif a.cmd == "prefixes":
