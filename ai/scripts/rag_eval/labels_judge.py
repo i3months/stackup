@@ -1,7 +1,7 @@
 """포함 판정 (T04, SPEC §4.3-1·3·4). LLM 판정 1회 = 텍스트 1개(청크 본문 또는 접두) + 그 페르소나 사실 전부.
 
     python labels_judge.py chunks   --variants summary-c1000o200,raw-c1000o200 [--personas P03,P26] [--model haiku] [--batch]
-    python labels_judge.py prefixes [--personas ...] [--model haiku] [--batch]
+    python labels_judge.py prefixes [--personas ...] [--variants raw-h2000o0] [--model haiku] [--batch]
     python labels_judge.py auto     --variants raw-c1000o200,...      # 원문 변형 자동 full (LLM 판정 뒤에 덮어쓴다)
     python labels_judge.py sample-kappa --personas P03,P26,P37 --n 180  # Haiku–Sonnet κ 묶음 (파일럿)
 
@@ -224,9 +224,10 @@ def auto_pass(variants: list[str]) -> dict[str, Any]:
 
 
 # ---- 접두 판정 (SPEC §4.3-4) -------------------------------------------------------
-def judge_prefixes(personas: set[str] | None, model: str, *, batch: bool) -> dict[str, Any]:
+def judge_prefixes(personas: set[str] | None, model: str, *, batch: bool, variants: list[str] | None = None) -> dict[str, Any]:
     """결정적 접두의 사실을 담는 부분은 문서 요약(≤200자)이라 문서마다 한 번 판정한다 (헤딩 경로는 청크마다 다르지만
-    사실을 담지 않는다). PFX-llm 접두는 청크마다 판정한다."""
+    사실을 담지 않는다). PFX-llm 접두는 청크마다 판정한다.
+    variants 를 주면 그 변형의 PFX-llm 접두만 판정한다 (결정적 접두는 건너뜀 — P-023: R-BEST 의 원문 llm 변형만)."""
     facts = load_facts()
     corpus = results_dir("E1-corpus")
     path = _labels_dir() / "prefix_containment.jsonl"
@@ -236,13 +237,13 @@ def judge_prefixes(personas: set[str] | None, model: str, *, batch: bool) -> dic
     for a in sorted((corpus / "analysis").glob("P*.json")):
         d = json.loads(a.read_text(encoding="utf-8"))
         pid = d["doc_id"].split("-")[0]
-        if personas and pid not in personas or ("deterministic", "*", d["doc_id"], None) in done:
+        if variants or personas and pid not in personas or ("deterministic", "*", d["doc_id"], None) in done:
             continue
         items.append({"cid": f"{_short(model)}-pd-{d['doc_id']}", "persona_id": pid, "text": d["summary"],
                       "kind": "문서 요약 접두", "fact_ids": [f["fact_id"] for f in facts[pid]],
                       "key": ("deterministic", "*", d["doc_id"], None)})
     for r in read_jsonl(_labels_dir() / "prefixes.jsonl"):
-        if r["prefix_id"] != "llm":
+        if r["prefix_id"] != "llm" or variants and r["variant_id"] not in variants:
             continue
         pid = r["doc_id"].split("-")[0]
         k = ("llm", r["variant_id"], r["doc_id"], r["chunk_index"])
@@ -325,10 +326,11 @@ def main() -> None:
     ap.add_argument("--model", default="haiku", choices=list(MODELS))
     ap.add_argument("--batch", action="store_true")
     ap.add_argument("--n", type=int, default=180)
-    ap.add_argument("--task", default="T04", choices=["T04", "T04b"], help="원장 task (T04b 확장은 상한 $10)")
+    ap.add_argument("--task", default="T04", choices=["T04", "T04b", "T05"],
+                    help="원장 task (T04b 확장은 상한 $10, T05 원문 llm 접두 판정은 $2 — P-023)")
     a = ap.parse_args()
     global TASK_ID, BUDGET
-    TASK_ID, BUDGET = a.task, {"T04": 20.0, "T04b": 10.0}[a.task]
+    TASK_ID, BUDGET = a.task, {"T04": 20.0, "T04b": 10.0, "T05": 2.0}[a.task]
     variants = [v for v in a.variants.split(",") if v]
     personas = set(a.personas.split(",")) if a.personas else None
     model = MODELS[a.model]
@@ -339,7 +341,7 @@ def main() -> None:
     elif a.cmd == "kappa":
         print(json.dumps(kappa_rerun(a.rubric, batch=a.batch), ensure_ascii=False))
     elif a.cmd == "prefixes":
-        print(json.dumps(judge_prefixes(personas, model, batch=a.batch), ensure_ascii=False))
+        print(json.dumps(judge_prefixes(personas, model, batch=a.batch, variants=variants or None), ensure_ascii=False))
     elif a.cmd == "auto":
         print(json.dumps(auto_pass(variants), ensure_ascii=False))
     else:
