@@ -8,7 +8,8 @@
   500/100·1500/300·헤딩(최대 2000) (탐색 조건 R-SRCraw-CH-* 의 수준).
 - EMB-4m·EMB-1-bf16 은 후보에서 뺀다 (점검용). 1단계 후보는 이미 돈 dev 조건 run 을 그대로 쓴다.
 - 새 조합 run 은 E2-retrieval/dev-rbest/<조합 id>-k5/ 에 둔다. 끊겨도 다시 돌리면 끝난 run 은 건너뛴다.
-- 새 접두가 필요한 조합(원문 + PFX-llm 등)은 M-M 이 필요하다 — 그 후보는 `needs_llm_prefix` 로 표시하고 멈춘다.
+- 새 접두가 필요한 조합(원문 + PFX-llm 등)은 prefixes.jsonl 에 그 변형의 llm 접두가 전부 있을 때만 평가하고, 없으면
+  `needs_llm_prefix` 로 표시하고 건너뛴다 (P-023: 접두를 만든 뒤 다시 돌린다).
 """
 
 from __future__ import annotations
@@ -95,12 +96,32 @@ def dev_ndcg(run_dir: Path, cond: C.Condition, ctx: dict[str, Any]) -> dict[str,
             "unreachable": s["unreachable"]}
 
 
+def llm_prefixed_variants() -> set[str]:
+    """prefixes.jsonl 에 PFX-llm 접두가 전 청크만큼 있는 변형."""
+    from t05_dev import _expected  # noqa: PLC0415
+
+    n: dict[str, int] = {}
+    for r in read_jsonl(results_dir(LABELS_DIR) / "prefixes.jsonl"):
+        if r["prefix_id"] == "llm":
+            n[r["variant_id"]] = n.get(r["variant_id"], 0) + 1
+    out = set()
+    for v, c in n.items():
+        src, rest = v.split("-", 1)
+        mode, size_ov = rest[0], rest[1:]
+        cs, co = size_ov.split("o")
+        cond = dataclasses.replace(C.load("B0"), index_source=src, chunk_size=int(cs), chunk_overlap=int(co),
+                                   chunk_mode="recursive" if mode == "c" else "heading")
+        if _expected(cond)[1] == c:
+            out.add(v)
+    return out
+
+
 def ensure_run(cond: C.Condition, cid: str, existing: dict[tuple, str], ctx: dict[str, Any]) -> tuple[Path | None, str]:
     """돈 적 있는 dev run 을 찾거나, 없으면 인덱싱·검색한다. (run 디렉터리, 출처)."""
     sig = signature(cond)
     if sig in existing:
         return _out(SPLIT, f"{existing[sig]}-k{K}"), f"dev/{existing[sig]}"
-    if cond.prefix == "llm" and cond.variant_id != "summary-c1000o200":
+    if cond.prefix == "llm" and cond.variant_id not in ctx["llm_prefixed"]:
         return None, "needs_llm_prefix"
     d = _out(f"{SPLIT}-rbest", f"{cid}-k{K}")
     if not _done(d, len(ctx["qlist"])):
@@ -138,6 +159,7 @@ def main() -> None:
     qlist = load_queries(results_dir("E1-queries") / "queries.jsonl", SPLIT)
     ctx = {"qlist": qlist, "queries": {q["query_id"]: q for q in qlist}, "by_var": {},
            "labels": Labels.load(LABELS_DIR, results_dir("E1-corpus") / "facts.jsonl")}
+    ctx["llm_prefixed"] = llm_prefixed_variants()
     cur = base
     cur_score = dev_ndcg(_out(SPLIT, f"B0-k{K}"), base, ctx)
     steps, adopted, stop_reason = [], [], None
@@ -184,6 +206,11 @@ def main() -> None:
            "stop_reason": stop_reason, "r_best": dataclasses.asdict(best) | {"variant_id": best.variant_id,
                                                                            "index_key": best.index_key},
            "r_best_dev": cur_score, "steps": steps, "ts": now_iso()}
+    # P-023: 원문 PFX-llm 후보를 건너뛴 첫 경로를 같이 남긴다 (두 경로 비교)
+    first = _out() / "R-BEST-selection-path1-no-raw-llm.json"
+    if first.exists():
+        out["path1_without_raw_llm_prefix"] = json.loads(first.read_text(encoding="utf-8"))
+    out["llm_prefixed_variants"] = sorted(ctx["llm_prefixed"])
     write_json(_out() / "R-BEST-selection.json", out)
     print(json.dumps({k: out[k] for k in ("adopted", "stop_reason", "r_best_dev")}, ensure_ascii=False, indent=1))
 
