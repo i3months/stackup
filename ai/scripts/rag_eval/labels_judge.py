@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import results_dir, write_jsonl  # noqa: E402
+from common import append_jsonl, results_dir, write_jsonl  # noqa: E402
 from labels import LABELS, auto_full, read_jsonl  # noqa: E402
 
 TASK_ID = "T04"
@@ -113,6 +113,9 @@ def run_requests(items: list[dict[str, Any]], model: str, *, batch: bool, run_id
         for i in range(0, len(reqs), 5000):
             part = reqs[i:i + 5000]
             bid = lab.submit_batch(part, estimate_usd=per * len(part) * 0.5, json_schema=SCHEMA)
+            # 기다리기 전에 batch id 를 디스크에 남긴다 — 중간에 죽어도 `recover --batches` 로 재제출 없이 회수 (T04 복구)
+            append_jsonl(_labels_dir() / "batches.jsonl", [{"batch_id": bid, "run_id": run_id, "model": model,
+                                                           "rubric": rubric, "n": len(part), "ts": _now()}])
             print(f"batch {bid} ({len(part)}건) 대기", flush=True)
             lab.wait_batch(bid, poll_sec=30)
             res = lab.collect_batch(bid)
@@ -168,7 +171,7 @@ def judge_chunks(variants: list[str], personas: set[str] | None, model: str, *, 
                              "persona_id": it["persona_id"], "rubric_version": rubric, "ts": ts})
             else:
                 missing += 1
-    write_jsonl(path, old + rows)
+    append_jsonl(path, rows)  # 기존 행은 그대로 두고 덧붙인다
     return {"requests": len(items), "pairs": len(rows), "missing_pairs": missing, "task_spent_usd": res["spent_task_usd"]}
 
 
@@ -200,7 +203,7 @@ def recover_chunks(variants: list[str], model: str, batch_ids: list[str], rubric
                                  "persona_id": it["persona_id"], "rubric_version": rubric, "ts": ts})
                 else:
                     missing += 1
-    write_jsonl(path, old + rows)
+    append_jsonl(path, rows)  # 기존 행은 그대로 두고 덧붙인다
     return {"unjudged_items": len(items), "matched": matched, "pairs": len(rows), "missing_pairs": missing,
             "task_spent_usd": round(lab.spent_usd(), 6)}
 
@@ -216,7 +219,7 @@ def auto_pass(variants: list[str]) -> dict[str, Any]:
     old = read_jsonl(path)
     have = {(r["chunk_key"], r["fact_id"]) for r in old if r["labeler"] == "auto"}
     add = [r for r in auto_full(chunks, facts, raw_docs) if (r["chunk_key"], r["fact_id"]) not in have]
-    write_jsonl(path, old + add)
+    append_jsonl(path, add)
     return {"auto_full_added": len(add)}
 
 
@@ -257,7 +260,7 @@ def judge_prefixes(personas: set[str] | None, model: str, *, batch: bool) -> dic
         pfx, var, doc, ci = it["key"]
         rows += [{"prefix_id": pfx, "variant_id": var, "doc_id": doc, "chunk_index": ci, "fact_id": f, "label": got[f],
                   "labeler": model, "rubric_version": "v2", "ts": ts} for f in it["fact_ids"] if got.get(f) in LABELS]
-    write_jsonl(path, old + rows)
+    append_jsonl(path, rows)  # 기존 행은 그대로 두고 덧붙인다
     return {"requests": len(items), "pairs": len(rows), "task_spent_usd": res["spent_task_usd"]}
 
 

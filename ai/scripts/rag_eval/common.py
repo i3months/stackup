@@ -100,6 +100,18 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    """줄 단위로 덧붙이고 디스크까지 내린다 (T04: 2026-10-14 전원 꺼짐 — 통째로 다시 쓰는 파일은 중간에 끊기면 잃는다)."""
+    import os  # noqa: PLC0415
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with Path(path).open("a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def write_json(path: Path, obj: Any) -> None:
     Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

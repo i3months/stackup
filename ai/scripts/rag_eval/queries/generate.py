@@ -331,15 +331,24 @@ class QueryGen:
 
 
 def generate_persona(gen: QueryGen, p: dict[str, Any], n_na: int, idx: int) -> list[dict[str, Any]]:
+    from common import append_jsonl  # noqa: PLC0415
+
     w = _out() / "work" / f"{p['pid']}.jsonl"
     if w.exists():
         return [json.loads(x) for x in w.read_text(encoding="utf-8").splitlines() if x.strip()]
-    out = []
+    # 질의마다 .partial 에 덧붙이고 다 끝나면 이름을 바꾼다. 중간에 끊기면 끝난 질의는 건너뛴다
+    # (seed 고정·cache_prompt=false 라 같은 질의가 다시 나온다 — P-018).
+    part = w.with_suffix(".partial.jsonl")
+    out = [json.loads(x) for x in part.read_text(encoding="utf-8").splitlines() if x.strip()] if part.exists() else []
+    done = {r["query_id"] for r in out}
     t0 = time.monotonic()
     for s in schedule(p, n_na, idx):
-        out.append(gen.one(p, s))
-    w.parent.mkdir(parents=True, exist_ok=True)
-    w.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in out), encoding="utf-8")
+        if s["query_id"] in done:
+            continue
+        rec = gen.one(p, s)
+        append_jsonl(part, [rec])
+        out.append(rec)
+    part.replace(w)
     print(f"== {p['pid']} {len(out)}개 {time.monotonic() - t0:.0f}s", flush=True)
     return out
 
