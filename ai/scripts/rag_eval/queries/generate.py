@@ -283,6 +283,10 @@ class QueryGen:
                 rec["no_answer_check"] = chk
                 if not chk["ok"]:
                     problems.append(f"정답 없음 답변이 페르소나 사실과 겹침 {chk}")
+            elif s["overlap_band"] and rec["overlap_coverage"] is None:
+                # 근거 문장이 토큰 0개 (예: 레포 변경 이력의 마크다운 링크 한 줄) — 포괄률을 잴 수 없어 다시 뽑아도
+                # 소용없다. 실측 대역 없이 남기고 보고서의 '대역 실패 원인(코드 근거)'에서 센다.
+                rec["band_unmeasurable"] = True
             elif s["overlap_band"] and rec["overlap_band_measured"] != s["overlap_band"]:
                 problems.append(f"포괄률 {rec['overlap_coverage']:.3f} ({rec['overlap_band_measured']}) 이 "
                                 f"{s['overlap_band']} 대역 밖")
