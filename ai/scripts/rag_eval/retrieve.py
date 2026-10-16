@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import conditions as C
-from common import PG_DSN_DEFAULT, RRF_K, RunRecorder, model_path, results_dir, write_jsonl
+from common import PG_DSN_DEFAULT, RRF_K, RunRecorder, append_jsonl, model_path, results_dir
 from index import DEVICE, D2560_TABLE, Embedder, ensure_tables, vec_literal
 
 # ---------------------------------------------------------------------------
@@ -324,10 +324,12 @@ def run(cond: C.Condition, queries: list[dict[str, Any]], k: int, *, run_id: str
                      config=cfg, model_ids=model_ids, notes=notes) as rr:
         s = Searcher(cond, production_sql=production_sql)
         rows = []
+        path = out_dir / "rankings.jsonl"
+        path.unlink(missing_ok=True)  # run 단위로 다시 돈다 (끊긴 run 은 run.json ended_at 이 null)
         for q in queries:
             rows.append(ranking_row(run_id, q, k, s.search(q["persona_id"], q["query_text"], k), keys))
+            append_jsonl(path, rows[-1:])
         s.emb.unload()
-        write_jsonl(out_dir / "rankings.jsonl", rows)
         rr.rec["config"]["ties"] = tie_stats(rows)
         rr.n_items = len(rows)
     return rows

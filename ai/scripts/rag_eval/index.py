@@ -325,7 +325,12 @@ def merge_jsonl(path: Path, rows: list[dict[str, Any]], key: str | tuple[str, ..
     if path.exists():
         keep = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
         keep = [r for r in keep if tuple(r.get(k) for k in keys) != vals]
-    write_jsonl(path, keep + rows)
+    # 다른 변형의 행도 같이 다시 쓰는 파일이라, 쓰다 끊기면 라벨 전체가 깨진다 → 임시 파일 + fsync + 교체 (T05)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    write_jsonl(tmp, keep + rows)
+    with tmp.open("rb") as fh:
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
 
 
 def chunks_and_prefixes(cond: C.Condition, corpus: str, out: str) -> tuple[list[dict[str, Any]], dict[tuple, str], str | None]:
