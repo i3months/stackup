@@ -142,6 +142,15 @@ def chunk_counts(pids: list[str]) -> dict[str, int]:
     return out
 
 
+def _by_cache_prompt(pids: list[str]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = defaultdict(list)
+    for pid in pids:
+        m = json.loads((_corpus() / "work" / pid / "plan.json").read_text(encoding="utf-8")).get("_meta", {})
+        v = m.get("cache_prompt", None)
+        out["omitted (server default true)" if v is None else str(v).lower()].append(pid)
+    return dict(out)
+
+
 def compile_outputs(pids: list[str]) -> dict[str, Any]:
     corpus = _corpus()
     facts, docs = [], []
@@ -181,6 +190,8 @@ def compile_outputs(pids: list[str]) -> dict[str, Any]:
         "preserved_rate_by": {k: {"full_rate": round(v["full"] / sum(v.values()), 3), **v} for k, v in sorted(pres_by.items())},
         "personas_by_generator_commit": {c: sorted(p for p, v in gen_commit.items() if v["commit"] == c)
                                          for c in sorted({v["commit"] for v in gen_commit.values()})},
+        # T04b (P-025): P01~P40 은 요청에 cache_prompt 를 보내지 않았다 (llama-server 기본값 true), P41~ 는 false
+        "personas_by_cache_prompt": _by_cache_prompt(pids),
         "chunks_per_persona": cc,
         "chunks_stats": {"min": min(cc.values()), "median": statistics.median(cc.values()), "max": max(cc.values())},
     }
