@@ -85,11 +85,14 @@ def _healthy(url: str) -> bool:
 
 
 def _alive(pid: int) -> bool:
+    """pid 가 살아 있고 그 프로세스가 llama-server 일 때만 참. WSL 재시작 뒤 남은 상태 파일의 pid 는 다른 프로세스가
+    다시 쓸 수 있다 (10-17: pid 510 재사용으로 start 가 거절됨, stop 은 남의 프로세스 그룹에 신호를 보낼 뻔함)."""
     try:
         os.kill(pid, 0)
-        return True
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         return False
+    return b"llama-server" in cmd
 
 
 def start(profile: str, n_cpu_moe: int | None = None, *, ctx: int | None = None, timeout: float = 900) -> dict[str, Any]:
@@ -98,7 +101,9 @@ def start(profile: str, n_cpu_moe: int | None = None, *, ctx: int | None = None,
     if st.exists():
         old = json.loads(st.read_text())
         if _alive(old["pid"]):
-            raise RuntimeError(f"{profile} 이미 실행 중 (pid {old['pid']}) — 먼저 stop")
+            state = "응답함" if _healthy(old.get("base_url") or base_url(profile)) else "/health 무응답"
+            raise RuntimeError(f"{profile} 이미 실행 중 (pid {old['pid']}, {state}) — 먼저 stop")
+        st.unlink()  # 남은 상태 파일 (재부팅·wsl --shutdown)
     args = build_args(profile, n_cpu_moe, ctx)
     vram_before = gpu_mem_used_mib()
     log = RUN_DIR / f"{profile}.log"

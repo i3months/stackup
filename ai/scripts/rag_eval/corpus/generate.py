@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import results_dir, stackup_commit  # noqa: E402
+from common import append_jsonl, results_dir, stackup_commit  # noqa: E402
+from labels import read_jsonl  # noqa: E402
 from local_llm import LocalLLM, LocalLLMError  # noqa: E402
 
 BASE_SEED = 7000
@@ -340,10 +341,16 @@ class Generator:
         timeline = career_timeline(slot["years_band"], seed)
         # 검증 실패가 4회 이어지면 seed 만 +50 바꿔 다시 4회 (최대 3개 seed, 관리자 T03 답변: P14).
         # 프롬프트·도메인·타임라인은 그대로다. 시도 이력은 _meta.history 에 남긴다.
-        history: list[dict[str, Any]] = []
-        for rnd in range(3):
-            problems: list[str] = []
-            for attempt in range(4):
+        # 시도마다 plan_attempts.jsonl 에 덧붙여, 재시작해도 이전 run 의 시도부터 이어서 센다 (P-017 상한, T04b P46).
+        log = self.work(slot["persona_id"]) / "plan_attempts.jsonl"
+        history: list[dict[str, Any]] = read_jsonl(log) if log.exists() else []
+        if len(history) >= 12:
+            raise RuntimeError(f"{slot['persona_id']} 설계서 시도 상한 12회 소진 (plan_attempts.jsonl) — 관리자 예외 필요")
+        done0 = len(history)
+        for rnd in range(done0 // 4, 3):
+            first = rnd == done0 // 4
+            problems: list[str] = history[-1]["problems"] if first and done0 % 4 else []
+            for attempt in range(done0 % 4 if first else 0, 4):
                 msgs = plan_prompt(slot, domain, repo, readme, used, timeline)
                 if problems:
                     msgs[-1]["content"] += "\n\n이전 시도의 문제 (반드시 고칠 것): " + "; ".join(problems)
@@ -354,6 +361,7 @@ class Generator:
                 if plan["name"] in used:
                     problems.append(f"이름 {plan['name']} 중복")
                 history.append({"seed_round": rnd, "attempt": attempt + 1, "seed": s, "problems": problems})
+                append_jsonl(log, [history[-1]])
                 if not problems:
                     break
                 print(f"  plan 재시도 {rnd}-{attempt + 1}: {problems}")
