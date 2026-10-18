@@ -68,9 +68,14 @@ def _dir() -> Path:
 def _llm_labels() -> dict[tuple[str, str], tuple[str, str]]:
     """(chunk_key, fact_id) → (label, labeler) — Labels 와 같은 우선순위 (사람 라벨 제외)."""
     best: dict[tuple[str, str], tuple[str, str, int]] = {}
+    seen: set[tuple[str, str, str, Any]] = set()
     for r in read_jsonl(results_dir("E1-labels") / "containment.jsonl"):
         if r["labeler"].startswith("human:"):
             continue
+        dk = (r["chunk_key"], r["fact_id"], r["labeler"], r.get("rubric_version"))
+        if dk in seen:  # 중복 판정 행은 첫 행만 (Labels 와 같다)
+            continue
+        seen.add(dk)
         k, rk = (r["chunk_key"], r["fact_id"]), labeler_rank(r["labeler"])
         if rk >= best.get(k, ("", "", 0))[2]:
             best[k] = (r["label"], r["labeler"], rk)

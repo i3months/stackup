@@ -32,7 +32,8 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def labeler_rank(labeler: str) -> int:
-    """같은 쌍에 판정이 여럿이면 사람 > auto(원문 자동 full) > LLM. 같은 등급이면 나중 행."""
+    """같은 쌍에 판정이 여럿이면 사람 > auto(원문 자동 full) > LLM. 같은 등급이면 나중 행
+    (단 같은 판정자·루브릭의 중복 행은 Labels 가 첫 행만 쓴다)."""
     if labeler.startswith("human:"):
         return 3
     return 2 if labeler == "auto" else 1
@@ -45,9 +46,17 @@ class Labels:
     def __init__(self, containment: Iterable[dict[str, Any]], facts: Iterable[dict[str, Any]]) -> None:
         self.label: dict[tuple[str, str], str] = {}
         rank: dict[tuple[str, str], int] = {}
+        seen: set[tuple[str, str, str, Any]] = set()
+        # 같은 (chunk_key, fact_id, labeler, rubric_version) 가 다시 나오면 첫 행만 쓰고 센다 (T04b 재판정 90쌍, P-030)
+        self.n_duplicates = 0
         for r in containment:
             if r["label"] not in LABELS:
                 raise ValueError(f"알 수 없는 라벨 {r['label']}")
+            dk = (r["chunk_key"], r["fact_id"], r["labeler"], r.get("rubric_version"))
+            if dk in seen:
+                self.n_duplicates += 1
+                continue
+            seen.add(dk)
             k, rk = (r["chunk_key"], r["fact_id"]), labeler_rank(r["labeler"])
             if rk >= rank.get(k, 0):
                 self.label[k], rank[k] = r["label"], rk
@@ -60,7 +69,10 @@ class Labels:
     def load(cls, labels_dir: str, facts_path: Path | None = None) -> "Labels":
         d = results_dir(labels_dir)
         facts_path = facts_path or results_dir("E1-corpus") / "facts.jsonl"
-        return cls(read_jsonl(d / "containment.jsonl"), read_jsonl(facts_path))
+        lab = cls(read_jsonl(d / "containment.jsonl"), read_jsonl(facts_path))
+        if lab.n_duplicates:
+            print(f"[labels] 중복 판정 행 {lab.n_duplicates}개는 첫 행만 썼다", file=sys.stderr)
+        return lab
 
     def judged(self, chunk_key: str, persona_id: str) -> bool:
         """그 페르소나의 모든 사실에 대해 판정이 있어야 판정 완료 (IDCG 가 전 청크·전 사실 기준이므로)."""

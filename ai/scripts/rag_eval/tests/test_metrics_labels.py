@@ -184,5 +184,17 @@ def test_labeler_priority_human_over_auto_over_llm():
     assert Labels([r("none", "claude-haiku-5-5"), r("full", "auto")], FACTS).label[("c", "F1")] == "full"
     # 사람 판정이 가장 우선
     assert Labels([r("full", "auto"), r("partial", "human:a")], FACTS).label[("c", "F1")] == "partial"
-    # 같은 등급이면 나중 행
-    assert Labels([r("none", "m"), r("partial", "m")], FACTS).label[("c", "F1")] == "partial"
+    # 같은 등급의 다른 판정자면 나중 행
+    assert Labels([r("none", "m"), r("partial", "n")], FACTS).label[("c", "F1")] == "partial"
+
+
+def test_duplicate_rows_first_wins_and_counted():
+    """같은 (chunk_key, fact_id, labeler, rubric_version) 가 다시 나오면 첫 행만 쓰고 센다 (P-030)."""
+    def r(label, rubric="v2"):
+        return {"chunk_key": "c", "fact_id": "F1", "label": label, "labeler": "m", "rubric_version": rubric, "ts": ""}
+
+    lab = Labels([r("none"), r("partial"), r("none")], FACTS)
+    assert lab.label[("c", "F1")] == "none" and lab.n_duplicates == 2
+    # 루브릭이 다르면 중복이 아니다 (같은 등급이라 나중 행)
+    lab = Labels([r("none", "v1"), r("partial", "v2")], FACTS)
+    assert lab.label[("c", "F1")] == "partial" and lab.n_duplicates == 0
