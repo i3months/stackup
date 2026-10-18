@@ -10,6 +10,8 @@
 - ICC 불확실성: dev 12명 페르소나 부트스트랩으로 ICC 분포를 구하고, 그 80% 분위 ICC 에서도 계산한다. 이때는
   페르소나 평균의 편차를 λ 배 해 ICC 를 맞춘다 (d' = d − d̄_p + d̄ + λ(d̄_p − d̄)).
 - 해석식도 같이: n_eff = N·m/(1 + (m − 1)ICC) · 3/π, 상한 (m → ∞) = N/ICC · 3/π.
+- T04b 뒤 (D.3): `actual` 에 실제 test 표본(페르소나별 정답 있는 질의 수, queries.jsonl 의 no_answer 만 센다)으로
+  같은 계산을 한다. 격자와 다른 난수열(SEED + 1)을 써서 격자 값은 그대로 재현된다. test 검색 결과는 읽지 않는다.
 """
 
 from __future__ import annotations
@@ -60,15 +62,17 @@ def with_icc(groups: list[list[float]], target: float) -> tuple[list[list[float]
     return scaled(hi), hi
 
 
-def sim_power(groups: list[list[float]], n_personas: int, m_ans: int, rng: random.Random) -> float:
+def sim_power(groups: list[list[float]], n_personas: int, m_ans: int | list[int], rng: random.Random) -> float:
+    """m_ans 가 목록이면 페르소나마다 그 개수 (n_personas 는 무시)."""
     from scipy.stats import wilcoxon  # noqa: PLC0415
 
+    ms = m_ans if isinstance(m_ans, list) else [m_ans] * n_personas
     rej = 0
     for _ in range(N_SIM):
         d = []
-        for _ in range(n_personas):
+        for m in ms:
             g = rng.choice(groups)
-            d += [rng.choice(g) for _ in range(m_ans)]
+            d += [rng.choice(g) for _ in range(m)]
         if any(x != 0 for x in d):
             rej += wilcoxon(d).pvalue < ALPHA
     return rej / N_SIM
@@ -82,8 +86,20 @@ def analytic(mean: float, sd: float, n_personas: int, m_ans: float, icc: float) 
             "n_eff_cap_m_inf": round(n_personas / icc * ARE, 1) if icc > 0 else None}
 
 
+def test_counts() -> list[int]:
+    """test 페르소나별 정답 있는 질의 수 (개수만)."""
+    by_p: dict[str, int] = defaultdict(int)
+    for line in (results_dir("E1-queries") / "queries.jsonl").read_text(encoding="utf-8").splitlines():
+        q = json.loads(line)
+        if q["split"] == "test" and not q["no_answer"]:
+            by_p[q["persona_id"]] += 1
+    return [by_p[p] for p in sorted(by_p)]
+
+
 def main() -> None:
     rng = random.Random(SEED)
+    rng_a = random.Random(SEED + 1)
+    counts = test_counts()
     out: dict[str, Any] = {"method": __doc__.strip().splitlines()[2:12], "alpha": ALPHA, "n_sim": N_SIM, "seed": SEED,
                            "ans_rate": round(ANS_RATE, 4), "ts": now_iso(), "hypotheses": {}}
     for h in ("H2a", "H2e"):
@@ -109,6 +125,14 @@ def main() -> None:
                                     **analytic(mean, sd, n_p, m_ans, icc80)}}
                 row["grid"].append(cell)
                 print(h, json.dumps(cell, ensure_ascii=False), flush=True)
+        n_p, n_ans = len(counts), sum(counts)
+        row["actual"] = {"n_test_personas": n_p, "n_answerable": n_ans, "m_answerable_mean": round(n_ans / n_p, 3),
+                         "m_answerable_dist": {str(k): counts.count(k) for k in sorted(set(counts))},
+                         "icc_dev": {"sim_power": round(sim_power(groups, n_p, counts, rng_a), 3),
+                                     **analytic(mean, sd, n_p, n_ans / n_p, icc0)},
+                         "icc_p80": {"sim_power": round(sim_power(g80, n_p, counts, rng_a), 3),
+                                     **analytic(mean, sd, n_p, n_ans / n_p, icc80)}}
+        print(h, "actual", json.dumps(row["actual"], ensure_ascii=False), flush=True)
         out["hypotheses"][h] = row
     write_json(results_dir("E2-retrieval") / "power-design.json", out)
 
