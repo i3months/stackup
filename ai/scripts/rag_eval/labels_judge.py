@@ -232,26 +232,32 @@ def judge_prefixes(personas: set[str] | None, model: str, *, batch: bool, varian
     corpus = results_dir("E1-corpus")
     path = _labels_dir() / "prefix_containment.jsonl"
     old = read_jsonl(path)
-    done = {(r["prefix_id"], r["variant_id"], r["doc_id"], r["chunk_index"]) for r in old if r["labeler"] == model}
+    # 접두마다 판정된 사실을 모은다 — 응답이 일부 사실을 빠뜨린 접두는 다시 돌리면 빠진 사실만 묻는다 (T04b P-030: 4건)
+    done: dict[tuple[Any, ...], set[str]] = defaultdict(set)
+    for r in old:
+        if r["labeler"] == model:
+            done[(r["prefix_id"], r["variant_id"], r["doc_id"], r["chunk_index"])].add(r["fact_id"])
     items = []
+
+    def add(cid: str, pid: str, text: str, kind: str, k: tuple[Any, ...]) -> None:
+        missing = [f["fact_id"] for f in facts[pid] if f["fact_id"] not in done.get(k, ())]
+        if missing:
+            items.append({"cid": cid, "persona_id": pid, "text": text, "kind": kind, "fact_ids": missing, "key": k})
+
     for a in sorted((corpus / "analysis").glob("P*.json")):
         d = json.loads(a.read_text(encoding="utf-8"))
         pid = d["doc_id"].split("-")[0]
-        if variants or personas and pid not in personas or ("deterministic", "*", d["doc_id"], None) in done:
+        if variants or personas and pid not in personas:
             continue
-        items.append({"cid": f"{_short(model)}-pd-{d['doc_id']}", "persona_id": pid, "text": d["summary"],
-                      "kind": "문서 요약 접두", "fact_ids": [f["fact_id"] for f in facts[pid]],
-                      "key": ("deterministic", "*", d["doc_id"], None)})
+        add(f"{_short(model)}-pd-{d['doc_id']}", pid, d["summary"], "문서 요약 접두", ("deterministic", "*", d["doc_id"], None))
     for r in read_jsonl(_labels_dir() / "prefixes.jsonl"):
         if r["prefix_id"] != "llm" or variants and r["variant_id"] not in variants:
             continue
         pid = r["doc_id"].split("-")[0]
-        k = ("llm", r["variant_id"], r["doc_id"], r["chunk_index"])
-        if personas and pid not in personas or k in done:
+        if personas and pid not in personas:
             continue
-        items.append({"cid": f"{_short(model)}-pl-{r['variant_id'][:20]}-{r['doc_id']}-{r['chunk_index']}",
-                      "persona_id": pid, "text": r["prefix_text"].strip(), "kind": "청크 맥락 접두",
-                      "fact_ids": [f["fact_id"] for f in facts[pid]], "key": k})
+        add(f"{_short(model)}-pl-{r['variant_id'][:20]}-{r['doc_id']}-{r['chunk_index']}", pid,
+            r["prefix_text"].strip(), "청크 맥락 접두", ("llm", r["variant_id"], r["doc_id"], r["chunk_index"]))
     if not items:
         return {"requests": 0}
     res = run_requests(items, model, batch=batch, run_id=f"E1b-prefix-{_short(model)}", rubric="v2")
@@ -262,7 +268,8 @@ def judge_prefixes(personas: set[str] | None, model: str, *, batch: bool, varian
         rows += [{"prefix_id": pfx, "variant_id": var, "doc_id": doc, "chunk_index": ci, "fact_id": f, "label": got[f],
                   "labeler": model, "rubric_version": "v2", "ts": ts} for f in it["fact_ids"] if got.get(f) in LABELS]
     append_jsonl(path, rows)  # 기존 행은 그대로 두고 덧붙인다
-    return {"requests": len(items), "pairs": len(rows), "task_spent_usd": res["spent_task_usd"]}
+    return {"requests": len(items), "pairs": len(rows), "missing_pairs": sum(len(it["fact_ids"]) for it in items) - len(rows),
+            "task_spent_usd": res["spent_task_usd"]}
 
 
 # ---- κ 표본 ----------------------------------------------------------------------
